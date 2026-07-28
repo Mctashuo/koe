@@ -37,8 +37,7 @@ If not installed, guide the user:
 
 ```bash
 # Option A: Homebrew (recommended)
-brew tap owo-network/brew
-brew install owo-network/brew/koe
+brew install koe --cask
 
 # Option B: Download from GitHub Releases
 # https://github.com/missuo/koe/releases/latest

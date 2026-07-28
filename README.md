@@ -51,8 +51,7 @@ themselves via Sparkle.
 ### Homebrew
 
 ```bash
-brew tap owo-network/brew
-brew install owo-network/brew/koe
+brew install koe --cask
 ```
 
 ### Release
