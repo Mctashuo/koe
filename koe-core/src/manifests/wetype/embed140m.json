@@ -1,7 +1,7 @@
 {
     "provider": "wetype",
     "mode": "asr",
-    "description": "WeType 微信输入法",
+    "description": "WeType 离线模型",
     "repo": "model.koe.li",
     "files": [
         {

@@ -46,7 +46,6 @@ use crate::event::AsrEvent;
 use crate::provider::AsrProvider;
 
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -785,7 +784,8 @@ pub struct WeTypeOfflineProvider {
     model: Option<Arc<Model>>,
     fbank: Option<Arc<FBank>>,
     pcm: Vec<i16>,
-    events: VecDeque<AsrEvent>,
+    event_tx: Option<tokio::sync::mpsc::UnboundedSender<AsrEvent>>,
+    event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AsrEvent>>,
     finished: bool,
 }
 
@@ -796,7 +796,8 @@ impl WeTypeOfflineProvider {
             model: None,
             fbank: None,
             pcm: Vec::new(),
-            events: VecDeque::new(),
+            event_tx: None,
+            event_rx: None,
             finished: false,
         }
     }
@@ -869,7 +870,10 @@ impl AsrProvider for WeTypeOfflineProvider {
             .map_err(|e| AsrError::Protocol(format!("model load join: {e}")))??;
         self.model = Some(model);
         self.fbank = Some(Arc::new(FBank::new()));
-        self.events.push_back(AsrEvent::Connected);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(AsrEvent::Connected);
+        self.event_tx = Some(tx);
+        self.event_rx = Some(rx);
         Ok(())
     }
 
@@ -896,22 +900,36 @@ impl AsrProvider for WeTypeOfflineProvider {
             tokio::task::spawn_blocking(move || Self::transcribe_blocking(model, fbank, pcm))
                 .await
                 .map_err(|e| AsrError::Protocol(format!("transcribe join: {e}")))?;
-        self.events.push_back(AsrEvent::Final(text));
-        self.events.push_back(AsrEvent::Closed(None));
+        if let Some(tx) = &self.event_tx {
+            let _ = tx.send(AsrEvent::Final(text));
+            let _ = tx.send(AsrEvent::Closed(None));
+        }
+        // Drop the sender so the receiver drains the two events above and then
+        // sees the channel close (recv() -> None) instead of blocking forever.
+        self.event_tx = None;
         Ok(())
     }
 
     async fn next_event(&mut self) -> Result<AsrEvent> {
-        if let Some(ev) = self.events.pop_front() {
-            Ok(ev)
+        // Block until an event is available (Connected on connect, then
+        // Final+Closed after finish_input). Returning Closed on an empty queue
+        // would make the driver's `select!` see an immediate close and abort
+        // ("connection closed unexpectedly").
+        if let Some(rx) = self.event_rx.as_mut() {
+            match rx.recv().await {
+                Some(ev) => Ok(ev),
+                None => Ok(AsrEvent::Closed(None)),
+            }
         } else {
-            Ok(AsrEvent::Closed(None))
+            Err(AsrError::Connection("not connected".into()))
         }
     }
 
     async fn close(&mut self) -> Result<()> {
         self.pcm.clear();
-        self.events.clear();
+        self.event_tx = None;
+        self.event_rx = None;
+        // Keep the cached model resident (see MODEL_CACHE); just drop our refs.
         self.model = None;
         self.fbank = None;
         Ok(())

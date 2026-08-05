@@ -58,3 +58,37 @@ async fn transcribes_test_zh() {
         "expected '今天天气很好', got {text:?}"
     );
 }
+
+/// Regression: the streaming driver polls `next_event()` in a `select!` while
+/// pumping audio. Before `finish_input`, `next_event()` must BLOCK — returning
+/// `Closed` on an empty queue made the driver abort with
+/// "connection closed unexpectedly by server".
+#[tokio::test]
+#[ignore = "needs KOE_WETYPE_MODEL_DIR"]
+async fn next_event_blocks_until_result() {
+    use std::time::Duration;
+    let dir = std::env::var("KOE_WETYPE_MODEL_DIR").expect("set KOE_WETYPE_MODEL_DIR");
+    let mut asr = WeTypeOfflineProvider::new(&dir);
+    asr.connect(&AsrConfig::default()).await.unwrap();
+
+    // first event is Connected
+    assert!(matches!(
+        asr.next_event().await.unwrap(),
+        AsrEvent::Connected
+    ));
+
+    // with no audio finished yet, next_event must not resolve (no early Closed)
+    let early = tokio::time::timeout(Duration::from_millis(300), asr.next_event()).await;
+    assert!(
+        early.is_err(),
+        "next_event returned before finish_input (would abort the session): {early:?}"
+    );
+
+    // now finish → Final then Closed arrive
+    asr.finish_input().await.unwrap();
+    assert!(matches!(
+        asr.next_event().await.unwrap(),
+        AsrEvent::Final(_)
+    ));
+    asr.close().await.unwrap();
+}
