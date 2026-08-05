@@ -787,7 +787,19 @@ pub struct WeTypeOfflineProvider {
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<AsrEvent>>,
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AsrEvent>>,
     finished: bool,
+    /// samples already covered by an interim decode (streaming cadence)
+    last_decoded: usize,
+    /// true while a background interim decode is running (one at a time)
+    decoding: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// set at finish_input so late interim tasks suppress their Interim event
+    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
+
+/// Emit an interim result roughly every this many samples of fresh audio
+/// (0.5 s @ 16 kHz). The interim decode re-runs the full forward on the
+/// audio-so-far — cheap for typical dictation lengths, and self-throttled to
+/// one decode at a time.
+const INTERIM_STRIDE_SAMPLES: usize = 8000;
 
 impl WeTypeOfflineProvider {
     pub fn new(model_dir: impl Into<PathBuf>) -> Self {
@@ -799,6 +811,9 @@ impl WeTypeOfflineProvider {
             event_tx: None,
             event_rx: None,
             finished: false,
+            last_decoded: 0,
+            decoding: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ended: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -878,9 +893,36 @@ impl AsrProvider for WeTypeOfflineProvider {
     }
 
     async fn send_audio(&mut self, frame: &[u8]) -> Result<()> {
+        use std::sync::atomic::Ordering;
         // interpret as little-endian i16 PCM, mono
         for c in frame.chunks_exact(2) {
             self.pcm.push(i16::from_le_bytes([c[0], c[1]]));
+        }
+        // Streaming: every ~0.5 s of fresh audio, kick off a background decode
+        // of the audio-so-far and emit an Interim result. Gated to one decode
+        // at a time so slow (long-utterance) decodes never pile up.
+        let n = self.pcm.len();
+        if !self.finished
+            && n.saturating_sub(self.last_decoded) >= INTERIM_STRIDE_SAMPLES
+            && self
+                .decoding
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            self.last_decoded = n;
+            let snapshot = self.pcm.clone();
+            let model = self.model.clone().unwrap();
+            let fbank = self.fbank.clone().unwrap();
+            let tx = self.event_tx.clone().unwrap();
+            let decoding = self.decoding.clone();
+            let ended = self.ended.clone();
+            tokio::task::spawn_blocking(move || {
+                let text = Self::transcribe_blocking(model, fbank, snapshot);
+                if !ended.load(Ordering::Acquire) && !text.is_empty() {
+                    let _ = tx.send(AsrEvent::Interim(text));
+                }
+                decoding.store(false, Ordering::Release);
+            });
         }
         Ok(())
     }
@@ -890,6 +932,9 @@ impl AsrProvider for WeTypeOfflineProvider {
             return Ok(());
         }
         self.finished = true;
+        // suppress any in-flight/late interim decode so it can't emit after Final
+        self.ended
+            .store(true, std::sync::atomic::Ordering::Release);
         let model = self
             .model
             .clone()

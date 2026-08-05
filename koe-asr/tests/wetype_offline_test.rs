@@ -92,3 +92,46 @@ async fn next_event_blocks_until_result() {
     ));
     asr.close().await.unwrap();
 }
+
+/// Streaming: pushing audio should produce at least one `Interim` result
+/// (live "pill" text) before the final one, rather than only Final at the end.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs KOE_WETYPE_MODEL_DIR"]
+async fn streaming_emits_interim() {
+    use std::time::Duration;
+    let dir = std::env::var("KOE_WETYPE_MODEL_DIR").expect("set KOE_WETYPE_MODEL_DIR");
+    let pcm = read_wav_pcm(&format!("{dir}/test_zh.wav"));
+
+    let mut asr = WeTypeOfflineProvider::new(&dir);
+    asr.connect(&AsrConfig::default()).await.unwrap();
+    for chunk in pcm.chunks(3200) {
+        asr.send_audio(chunk).await.unwrap();
+    }
+    // let the in-flight interim decode finish and emit
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let mut interims = 0;
+    // drain whatever is queued so far (Connected + any Interim), non-blocking
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(20), asr.next_event()).await {
+        if let AsrEvent::Interim(t) = ev {
+            interims += 1;
+            println!("interim: {t:?}");
+        }
+    }
+    assert!(interims >= 1, "expected at least one Interim during streaming");
+
+    asr.finish_input().await.unwrap();
+    let mut final_text = String::new();
+    loop {
+        match asr.next_event().await.unwrap() {
+            AsrEvent::Final(t) => {
+                final_text = t;
+                break;
+            }
+            AsrEvent::Closed(_) => break,
+            _ => {}
+        }
+    }
+    assert!(final_text.contains("天气很好"), "final = {final_text:?}");
+    asr.close().await.unwrap();
+}

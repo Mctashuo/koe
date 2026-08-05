@@ -2,6 +2,18 @@
 
 All notable user-facing changes to Koe are documented here.
 
+## 1.0.26 - 2026-08-05
+
+### Improved
+
+- **WeType (On-Device) now streams live results.** The offline model previously showed its transcript only after you stopped talking; it now emits interim results while you speak, so the overlay pill updates live like the cloud providers.
+
+## 1.0.25 - 2026-08-05
+
+### Added
+
+- **WeType (On-Device) — a fully on-device Chinese voice input.** Reverse-engineered from WeChat Input Method's offline voice model and reimplemented in pure Rust: everything runs locally (no network, no account, no server round-trip), about 180 MB, faster than real-time on Apple Silicon. Pick "WeType (On-Device)" as your ASR provider and download the model once from Settings.
+
 ## 1.0.23 - 2026-07-19
 
 ### Fixed
