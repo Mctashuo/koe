@@ -5,6 +5,21 @@
     <description>Updates for the standard app (Apple Silicon).</description>
     <language>en</language>
     <item>
+      <title>Version 1.0.24</title>
+      <link>https://github.com/missuo/koe/releases/tag/v1.0.24</link>
+      <description><![CDATA[
+<p>See the <a href="https://github.com/missuo/koe/releases/tag/v1.0.24">full release notes</a>.</p>
+      ]]></description>
+      <sparkle:version>25</sparkle:version>
+      <sparkle:shortVersionString>1.0.24</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <pubDate>Wed, 05 Aug 2026 13:03:52 GMT</pubDate>
+      <enclosure url="https://github.com/missuo/koe/releases/download/v1.0.24/Koe-macOS-arm64.zip"
+        sparkle:edSignature="a9VIK7vJngUNKt6f0oARPE2V9b9T2x+SwzZZF7TkwYlws/3DSC9nwdMfVMkmLtMKi65pe1v0ubGcupedCVl0DQ=="
+        length="12187294"
+        type="application/octet-stream" />
+    </item>
+    <item>
       <title>Version 1.0.23</title>
       <link>https://github.com/missuo/koe/releases/tag/v1.0.23</link>
       <description><![CDATA[

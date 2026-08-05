@@ -1,11 +1,11 @@
 {
-  "version": "1.0.23",
-  "build": 24,
-  "published_at": "2026-07-19T12:03:32Z",
+  "version": "1.0.24",
+  "build": 25,
+  "published_at": "2026-08-05T13:03:52Z",
   "minimum_system_version": "14.0",
-  "download_url": "https://github.com/missuo/koe/releases/download/v1.0.23/Koe-MLX-macOS-arm64.zip",
-  "release_notes_url": "https://github.com/missuo/koe/releases/tag/v1.0.23",
+  "download_url": "https://github.com/missuo/koe/releases/download/v1.0.24/Koe-MLX-macOS-arm64.zip",
+  "release_notes_url": "https://github.com/missuo/koe/releases/tag/v1.0.24",
   "notes": [
-    "See the full release notes at https://github.com/missuo/koe/releases/tag/v1.0.23"
+    "See the full release notes at https://github.com/missuo/koe/releases/tag/v1.0.24"
   ]
 }
