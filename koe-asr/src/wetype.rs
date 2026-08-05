@@ -703,10 +703,29 @@ fn mha(q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>, t: usize) -> Array2<f3
     out
 }
 
+/// Attention where `q` [Tq,512] attends over `kk`/`vv` [Tk,512] (Tk = cache + current).
+fn attn_cached(q: &Array2<f32>, kk: &Array2<f32>, vv: &Array2<f32>) -> Array2<f32> {
+    let scale = 0.125f32;
+    let tq = q.nrows();
+    let mut out = Array2::<f32>::zeros((tq, D));
+    for head in 0..H {
+        let c0 = head * HD;
+        let qh = q.slice(s![.., c0..c0 + HD]);
+        let kh = kk.slice(s![.., c0..c0 + HD]);
+        let vh = vv.slice(s![.., c0..c0 + HD]);
+        let mut sc = qh.dot(&kh.t()); // [Tq,Tk]
+        sc.mapv_inplace(|x| x * scale);
+        softmax_rows(&mut sc);
+        let oh = sc.dot(&vh); // [Tq,HD]
+        out.slice_mut(s![.., c0..c0 + HD]).assign(&oh);
+    }
+    out
+}
+
 impl Model {
-    fn forward(&self, feat: &Array2<f32>) -> Array2<f32> {
+    /// Conv2D subsampling front-end: FBank features [T,40] -> encoder input [T/5, 512].
+    fn frontend(&self, feat: &Array2<f32>) -> Array2<f32> {
         let t_in = feat.nrows();
-        // frontend: feat [T,40] as [1,T,40]
         let mut x3 = Array3::<f32>::zeros((1, t_in, 40));
         for i in 0..t_in {
             for j in 0..40 {
@@ -715,13 +734,11 @@ impl Model {
         }
         let a = relu3(conv2d(&x3, &self.fc0, (1, 1), (2, 2)));
         let b = relu3(conv2d(&a, &self.fc1, (5, 1), (1, 3)));
-        // pad W by (0,1)
         let (cb, hb, wb) = (b.shape()[0], b.shape()[1], b.shape()[2]);
         let mut bp = Array3::<f32>::zeros((cb, hb, wb + 1));
         bp.slice_mut(s![.., .., 0..wb]).assign(&b);
         let cc = relu3(conv2d(&bp, &self.fc2, (1, 2), (1, 0)));
         let (co, tt, wo) = (cc.shape()[0], cc.shape()[1], cc.shape()[2]);
-        // transpose (1,0,2) -> [T, Co, W] -> reshape [T, Co*W]
         let mut flat = Array2::<f32>::zeros((tt, co * wo));
         for ti in 0..tt {
             for ci in 0..co {
@@ -730,8 +747,15 @@ impl Model {
                 }
             }
         }
-        let mut x = self.flin.matmul_bias(&flat, &self.flb); // [T,512]
-        // 40 pre-norm layers
+        self.flin.matmul_bias(&flat, &self.flb) // [T,512]
+    }
+
+    /// Full bidirectional encode over the whole utterance -> CTC logits [T,VOCAB].
+    /// Highest quality; used for the final result.
+    fn forward(&self, feat: &Array2<f32>) -> Array2<f32> {
+        let x0 = self.frontend(feat);
+        let tt = x0.nrows();
+        let mut x = x0;
         for l in &self.layers {
             let h = layer_norm(&x, &l.pnw, &l.pnb);
             let q = l.q.matmul(&h);
@@ -744,6 +768,82 @@ impl Model {
             x = &x + &l.f2.matmul_bias(&ff, &l.f2b);
         }
         self.ow.matmul_bias(&x, &self.ob) // [T,VOCAB]
+    }
+
+    /// Streaming chunk encode with a per-layer K/V cache (bypass path).
+    /// `seg` = encoder-input frames for [content ++ right-lookahead] (`ncont` content
+    /// frames first). `ck`/`cv` hold each layer's cached finalized-content K/V ([n,512]);
+    /// they are extended by this chunk's content K/V (capped at `lcap`). Returns CTC
+    /// logits for the `ncont` content frames.
+    fn stream_chunk(
+        &self,
+        seg: &Array2<f32>,
+        ncont: usize,
+        ck: &mut [Array2<f32>],
+        cv: &mut [Array2<f32>],
+        lcap: usize,
+    ) -> Array2<f32> {
+        let nseg = seg.nrows();
+        let mut x = seg.clone();
+        for (li, l) in self.layers.iter().enumerate() {
+            let h = layer_norm(&x, &l.pnw, &l.pnb);
+            let q = l.q.matmul(&h); // [nseg,512]
+            let k = l.k.matmul(&h);
+            let v = l.v.matmul(&h);
+            // keys/values = cached past content ++ this segment
+            let past = ck[li].nrows();
+            let mut kk = Array2::<f32>::zeros((past + nseg, D));
+            let mut vv = Array2::<f32>::zeros((past + nseg, D));
+            if past > 0 {
+                kk.slice_mut(s![0..past, ..]).assign(&ck[li]);
+                vv.slice_mut(s![0..past, ..]).assign(&cv[li]);
+            }
+            kk.slice_mut(s![past.., ..]).assign(&k);
+            vv.slice_mut(s![past.., ..]).assign(&v);
+            let attn = attn_cached(&q, &kk, &vv);
+            x = &x + &l.o.matmul(&attn);
+            let h2 = layer_norm(&x, &l.mnw, &l.mnb);
+            let ff = gelu(l.f1.matmul_bias(&h2, &l.f1b));
+            x = &x + &l.f2.matmul_bias(&ff, &l.f2b);
+            // append this chunk's content K/V to the cache, capped to lcap frames
+            let kc = k.slice(s![0..ncont, ..]);
+            let vc = v.slice(s![0..ncont, ..]);
+            let newn = (past + ncont).min(lcap);
+            let mut nk = Array2::<f32>::zeros((newn, D));
+            let mut nv = Array2::<f32>::zeros((newn, D));
+            let keep_past = newn.saturating_sub(ncont);
+            if keep_past > 0 {
+                nk.slice_mut(s![0..keep_past, ..])
+                    .assign(&ck[li].slice(s![past - keep_past.., ..]));
+                nv.slice_mut(s![0..keep_past, ..])
+                    .assign(&cv[li].slice(s![past - keep_past.., ..]));
+            }
+            let take = newn - keep_past;
+            nk.slice_mut(s![keep_past.., ..])
+                .assign(&kc.slice(s![ncont - take.., ..]));
+            nv.slice_mut(s![keep_past.., ..])
+                .assign(&vc.slice(s![ncont - take.., ..]));
+            ck[li] = nk;
+            cv[li] = nv;
+        }
+        let cont = x.slice(s![0..ncont, ..]).to_owned();
+        self.ow.matmul_bias(&cont, &self.ob) // [ncont,VOCAB]
+    }
+
+    /// CTC greedy collapse of a running list of per-frame argmax ids -> text.
+    fn collapse_ids(&self, ids: &[usize]) -> String {
+        let mut out = String::new();
+        let mut prev: i64 = -1;
+        for &i in ids {
+            if i as i64 != prev && i != 0 {
+                let tok = &self.vocab[i];
+                if tok != "<BLANK>" && tok != "<UNK>" && tok != "<SPACE>" {
+                    out.push_str(tok);
+                }
+            }
+            prev = i as i64;
+        }
+        out
     }
 
     fn decode(&self, logits: &Array2<f32>) -> String {
@@ -787,19 +887,25 @@ pub struct WeTypeOfflineProvider {
     event_tx: Option<tokio::sync::mpsc::UnboundedSender<AsrEvent>>,
     event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<AsrEvent>>,
     finished: bool,
-    /// samples already covered by an interim decode (streaming cadence)
-    last_decoded: usize,
-    /// true while a background interim decode is running (one at a time)
-    decoding: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// set at finish_input so late interim tasks suppress their Interim event
-    ended: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// PCM sample count at the last streaming trigger
+    last_stream_samples: usize,
+    /// next content-chunk start (encoder frame) for the bypass streaming pass
+    stream_pos: usize,
+    /// per-layer cached K/V of finalized content frames (bypass KV-cache)
+    stream_ck: Vec<Array2<f32>>,
+    stream_cv: Vec<Array2<f32>>,
+    /// finalized per-frame argmax ids, CTC-collapsed into the interim text
+    stream_ids: Vec<usize>,
 }
 
-/// Emit an interim result roughly every this many samples of fresh audio
-/// (0.5 s @ 16 kHz). The interim decode re-runs the full forward on the
-/// audio-so-far — cheap for typical dictation lengths, and self-throttled to
-/// one decode at a time.
-const INTERIM_STRIDE_SAMPLES: usize = 8000;
+// Bypass (low-latency interim) streaming block in ENCODER frames — mirrors
+// sr_online.conf `block_spec_bypass = 200:30:100` (feature frames) + `cache_max_steps_bypass = 40`:
+// feature/5 → left-cache 40, content 6, right-lookahead 20.
+const BYPASS_CONTENT: usize = 6;
+const BYPASS_LOOKAHEAD: usize = 20;
+const BYPASS_CACHE: usize = 40;
+/// Recompute the streaming front-end and emit an interim at most this often (~0.32 s @ 16 kHz).
+const STREAM_STRIDE_SAMPLES: usize = 5120;
 
 impl WeTypeOfflineProvider {
     pub fn new(model_dir: impl Into<PathBuf>) -> Self {
@@ -811,9 +917,11 @@ impl WeTypeOfflineProvider {
             event_tx: None,
             event_rx: None,
             finished: false,
-            last_decoded: 0,
-            decoding: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            ended: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_stream_samples: 0,
+            stream_pos: 0,
+            stream_ck: Vec::new(),
+            stream_cv: Vec::new(),
+            stream_ids: Vec::new(),
         }
     }
 
@@ -885,6 +993,12 @@ impl AsrProvider for WeTypeOfflineProvider {
             .map_err(|e| AsrError::Protocol(format!("model load join: {e}")))??;
         self.model = Some(model);
         self.fbank = Some(Arc::new(FBank::new()));
+        // fresh streaming state
+        self.stream_ck = (0..NLAYERS).map(|_| Array2::<f32>::zeros((0, D))).collect();
+        self.stream_cv = (0..NLAYERS).map(|_| Array2::<f32>::zeros((0, D))).collect();
+        self.stream_pos = 0;
+        self.stream_ids.clear();
+        self.last_stream_samples = 0;
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let _ = tx.send(AsrEvent::Connected);
         self.event_tx = Some(tx);
@@ -893,36 +1007,64 @@ impl AsrProvider for WeTypeOfflineProvider {
     }
 
     async fn send_audio(&mut self, frame: &[u8]) -> Result<()> {
-        use std::sync::atomic::Ordering;
         // interpret as little-endian i16 PCM, mono
         for c in frame.chunks_exact(2) {
             self.pcm.push(i16::from_le_bytes([c[0], c[1]]));
         }
-        // Streaming: every ~0.5 s of fresh audio, kick off a background decode
-        // of the audio-so-far and emit an Interim result. Gated to one decode
-        // at a time so slow (long-utterance) decodes never pile up.
         let n = self.pcm.len();
-        if !self.finished
-            && n.saturating_sub(self.last_decoded) >= INTERIM_STRIDE_SAMPLES
-            && self
-                .decoding
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
-            self.last_decoded = n;
-            let snapshot = self.pcm.clone();
-            let model = self.model.clone().unwrap();
-            let fbank = self.fbank.clone().unwrap();
-            let tx = self.event_tx.clone().unwrap();
-            let decoding = self.decoding.clone();
-            let ended = self.ended.clone();
-            tokio::task::spawn_blocking(move || {
-                let text = Self::transcribe_blocking(model, fbank, snapshot);
-                if !ended.load(Ordering::Acquire) && !text.is_empty() {
-                    let _ = tx.send(AsrEvent::Interim(text));
+        if self.finished || n.saturating_sub(self.last_stream_samples) < STREAM_STRIDE_SAMPLES {
+            return Ok(());
+        }
+        self.last_stream_samples = n;
+        // Bypass KV-cache streaming pass: advance the per-layer cache over any newly
+        // available content chunks (each needs BYPASS_LOOKAHEAD frames of right context)
+        // and emit a live interim. Only new chunks are computed — the cache makes this
+        // O(new frames), not a full re-decode.
+        let model = self.model.clone().unwrap();
+        let fbank = self.fbank.clone().unwrap();
+        let pcm = self.pcm.clone();
+        let mut ck = std::mem::take(&mut self.stream_ck);
+        let mut cv = std::mem::take(&mut self.stream_cv);
+        let mut pos = self.stream_pos;
+        let mut ids = std::mem::take(&mut self.stream_ids);
+        let (ck, cv, pos, ids, text) = tokio::task::spawn_blocking(move || {
+            let sig: Vec<f32> = pcm.iter().map(|&s| s as f32).collect();
+            let feat = fbank.compute(&sig);
+            if feat.nrows() > 0 {
+                let x0 = model.frontend(&feat);
+                let t = x0.nrows();
+                while pos + BYPASS_CONTENT + BYPASS_LOOKAHEAD <= t {
+                    let end = pos + BYPASS_CONTENT + BYPASS_LOOKAHEAD;
+                    let seg = x0.slice(s![pos..end, ..]).to_owned();
+                    let logits =
+                        model.stream_chunk(&seg, BYPASS_CONTENT, &mut ck, &mut cv, BYPASS_CACHE);
+                    for row in logits.rows() {
+                        let mut best = 0usize;
+                        let mut bv = f32::NEG_INFINITY;
+                        for (i, &v) in row.iter().enumerate() {
+                            if v > bv {
+                                bv = v;
+                                best = i;
+                            }
+                        }
+                        ids.push(best);
+                    }
+                    pos += BYPASS_CONTENT;
                 }
-                decoding.store(false, Ordering::Release);
-            });
+            }
+            let text = model.collapse_ids(&ids);
+            (ck, cv, pos, ids, text)
+        })
+        .await
+        .map_err(|e| AsrError::Protocol(format!("stream join: {e}")))?;
+        self.stream_ck = ck;
+        self.stream_cv = cv;
+        self.stream_pos = pos;
+        self.stream_ids = ids;
+        if !text.is_empty() {
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(AsrEvent::Interim(text));
+            }
         }
         Ok(())
     }
@@ -932,9 +1074,8 @@ impl AsrProvider for WeTypeOfflineProvider {
             return Ok(());
         }
         self.finished = true;
-        // suppress any in-flight/late interim decode so it can't emit after Final
-        self.ended
-            .store(true, std::sync::atomic::Ordering::Release);
+        // Final result: full bidirectional decode over the whole utterance (the
+        // main/high-quality pass; the streaming bypass above was interim-only).
         let model = self
             .model
             .clone()
@@ -949,8 +1090,6 @@ impl AsrProvider for WeTypeOfflineProvider {
             let _ = tx.send(AsrEvent::Final(text));
             let _ = tx.send(AsrEvent::Closed(None));
         }
-        // Drop the sender so the receiver drains the two events above and then
-        // sees the channel close (recv() -> None) instead of blocking forever.
         self.event_tx = None;
         Ok(())
     }
@@ -974,6 +1113,9 @@ impl AsrProvider for WeTypeOfflineProvider {
         self.pcm.clear();
         self.event_tx = None;
         self.event_rx = None;
+        self.stream_ck.clear();
+        self.stream_cv.clear();
+        self.stream_ids.clear();
         // Keep the cached model resident (see MODEL_CACHE); just drop our refs.
         self.model = None;
         self.fbank = None;

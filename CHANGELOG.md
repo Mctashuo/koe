@@ -6,7 +6,7 @@ All notable user-facing changes to Koe are documented here.
 
 ### Improved
 
-- **WeType (On-Device) now streams live results.** The offline model previously showed its transcript only after you stopped talking; it now emits interim results while you speak, so the overlay pill updates live like the cloud providers.
+- **WeType (On-Device) now streams live, low-latency results.** The offline model previously showed its transcript only after you stopped talking. It now uses the model's native KV-cache streaming to emit interim results while you speak (a fast, low-latency pass), then finalizes a full-quality transcript when you stop — so the overlay pill updates live like the cloud providers.
 
 ## 1.0.25 - 2026-08-05
 
