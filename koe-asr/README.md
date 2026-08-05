@@ -7,7 +7,7 @@ A Rust library for streaming ASR (Automatic Speech Recognition) with a unified a
 - **Unified `AsrProvider` trait** — swap providers without changing application logic
 - **Streaming recognition** — receive interim, definite, and final results as audio is processed
 - **Cloud providers** — Volcengine Doubao, Doubao IME (free), Alibaba Qwen
-- **Local providers** — Apple Speech Framework, MLX Whisper (Apple Silicon), Sherpa-ONNX
+- **Local providers** — Apple Speech Framework, MLX Whisper (Apple Silicon), Sherpa-ONNX, WeType (on-device Chinese, pure-Rust)
 - **TranscriptAggregator** — built-in helper to merge streaming events into a single transcript
 - **Hotword support** — boost recognition accuracy for domain-specific vocabulary
 - **Async/await** — built on `tokio` with `async-trait`
@@ -22,6 +22,7 @@ A Rust library for streaming ASR (Automatic Speech Recognition) with a unified a
 | `AppleSpeechProvider` | macOS Speech Framework | `apple-speech` | Local | None |
 | `MlxProvider` | MLX Whisper (Apple Silicon) | `mlx` | Local | None (local model) |
 | `SherpaOnnxProvider` | Sherpa-ONNX | `sherpa-onnx` | Local | None (local model) |
+| `WeTypeOfflineProvider` | WeType `embed_140m` (on-device Chinese, pure-Rust) | `wetype-offline` | Local | None (downloads model) |
 
 ## Installation
 
@@ -157,6 +158,49 @@ async fn main() -> Result<(), koe_asr::AsrError> {
 }
 ```
 
+### WeType (On-Device Chinese, Pure-Rust)
+
+Fully local Chinese speech-to-text — a pure-Rust reimplementation of WeChat
+Input Method's on-device `embed_140m` model (a 40-layer pre-norm Transformer
+CTC, reverse-engineered from its XNET blob). No network, no account, and no
+external inference engine — just `ndarray` (matmuls) and `rustfft` (FBank).
+Weights are kept int8-resident (~180 MB RAM) and shared across sessions.
+It emits live interim results via the model's native **KV-cache streaming**,
+then a full-quality final transcript when you stop.
+
+Needs a directory holding `embed140m.koepack` (~135 MB) and
+`dict.decoder.utf8.txt`; `ensure_and_new` downloads and SHA-256-verifies them
+on first use (skips the network if already present).
+
+```rust
+use koe_asr::wetype::WeTypeOfflineProvider;
+use koe_asr::{AsrConfig, AsrProvider};
+
+#[tokio::main]
+async fn main() -> Result<(), koe_asr::AsrError> {
+    let mut asr = WeTypeOfflineProvider::ensure_and_new(
+        "/path/to/model_dir",
+        "https://model.koe.li",            // host serving the two model files
+        |file, done, total| {
+            if let Some(t) = total {
+                eprintln!("{file}: {done}/{t} bytes");
+            }
+        },
+    )
+    .await?;
+
+    asr.connect(&AsrConfig::default()).await?;
+    // asr.send_audio(&pcm16le_mono_16k).await?;  // Interim results stream live
+    asr.finish_input().await?;                    // then a full-quality Final
+    // ... standard next_event loop ...
+    asr.close().await?;
+    Ok(())
+}
+```
+
+Requires the `wetype-offline` feature. Use `WeTypeOfflineProvider::new(dir)`
+directly if you manage the model files yourself.
+
 ## Provider Trait
 
 All providers implement the `AsrProvider` trait, making them interchangeable:
@@ -236,7 +280,7 @@ let config = AsrConfig {
 };
 ```
 
-Local providers (`MlxProvider`, `AppleSpeechProvider`, `SherpaOnnxProvider`) use their own config structs passed to `new()` and ignore `AsrConfig`.
+Local providers (`MlxProvider`, `AppleSpeechProvider`, `SherpaOnnxProvider`, `WeTypeOfflineProvider`) use their own config structs / constructors and ignore `AsrConfig`.
 
 ## TranscriptAggregator
 
