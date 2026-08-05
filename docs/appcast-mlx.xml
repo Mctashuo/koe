@@ -5,6 +5,24 @@
     <description>Updates for the app with on-device MLX model support (Apple Silicon).</description>
     <language>en</language>
     <item>
+      <title>Version 1.0.26</title>
+      <link>https://github.com/missuo/koe/releases/tag/v1.0.26</link>
+      <description><![CDATA[
+<h3>Improved</h3>
+<ul>
+<li><strong>WeType (On-Device) now streams live, low-latency results.</strong> The offline model previously showed its transcript only after you stopped talking. It now uses the model's native KV-cache streaming to emit interim results while you speak (a fast, low-latency pass), then finalizes a full-quality transcript when you stop — so the overlay pill updates live like the cloud providers.</li>
+</ul>
+      ]]></description>
+      <sparkle:version>27</sparkle:version>
+      <sparkle:shortVersionString>1.0.26</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <pubDate>Wed, 05 Aug 2026 14:44:37 GMT</pubDate>
+      <enclosure url="https://github.com/missuo/koe/releases/download/v1.0.26/Koe-MLX-macOS-arm64.zip"
+        sparkle:edSignature="djE5CI+H31+QzSeNwSC9u376sME31/kjkI0seX/eVPaGaWcWEPImGz6IobHZ0LmNhyaLbchdbjP79lcqqVLGDA=="
+        length="32976624"
+        type="application/octet-stream" />
+    </item>
+    <item>
       <title>Version 1.0.25</title>
       <link>https://github.com/missuo/koe/releases/tag/v1.0.25</link>
       <description><![CDATA[
