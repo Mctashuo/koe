@@ -8,7 +8,10 @@
       <title>Version 1.0.25</title>
       <link>https://github.com/missuo/koe/releases/tag/v1.0.25</link>
       <description><![CDATA[
-<p>See the <a href="https://github.com/missuo/koe/releases/tag/v1.0.25">full release notes</a>.</p>
+<h3>New</h3>
+<ul>
+<li><strong>WeType (On-Device) — 微信输入法离线语音.</strong> A fully on-device Chinese speech-to-text engine, reverse-engineered from WeChat Input Method's offline voice model. Everything runs locally — no network, no account, no server round-trip. About 180&nbsp;MB, faster than real-time on Apple Silicon. Pick <em>WeType (On-Device)</em> as your ASR provider and download the model once from Settings.</li>
+</ul>
       ]]></description>
       <sparkle:version>26</sparkle:version>
       <sparkle:shortVersionString>1.0.25</sparkle:shortVersionString>
