@@ -320,6 +320,7 @@ static BOOL SPLabFlag(const char *name) {
         // Start watching config file for hotkey changes
         [self startConfigWatcher];
     }];
+
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
@@ -1047,11 +1048,11 @@ static BOOL SPLabFlag(const char *name) {
     self.sessionWantsAudioCapture = NO;
     self.hotkeyMonitor.suspended = YES;
 
-    // Stop the hotkey monitor FIRST, before any slow teardown (audio, Rust).
-    // While the monitor's event tap is alive, a blocked process stalls the
-    // session's keyboard stream: keystrokes get swallowed and WindowServer
-    // accumulates stale modifier state that it flushes as phantom
-    // FlagsChanged events when the tap dies (issues #57/#65).
+    // Stop the hotkey monitor FIRST, before any slow teardown (audio, Rust):
+    // while a CONSUMING tap is alive (non-modifier triggers), a blocked
+    // process would stall the session's keyboard stream for every app.
+    // (The historical phantom-keys-at-quit bug, issues #57/#65, turned out
+    // to be SPPermissionManager's leaked probe taps, not this teardown.)
     [self.hotkeyMonitor stop];
 
     // Cancel any pending session-end block so it cannot trigger a paste

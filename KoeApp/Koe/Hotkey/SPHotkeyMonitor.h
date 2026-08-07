@@ -64,13 +64,10 @@ typedef NS_ENUM(uint8_t, SPHotkeyTriggerMode) {
 /// a second one. Pair with `resetToIdle` when the same source ends the session.
 - (void)markExternalToggleRecording;
 
-/// Whether the current CGEventTap can consume handled key events globally.
-@property (nonatomic, assign, readonly) BOOL canConsumeGlobalKeyEvents;
-
 /// Whether the number/Enter handler keys can actually be swallowed globally
 /// right now. For modifier-only triggers this reflects the Carbon hotkey
-/// capture (the tap stays listen-only for its whole life — see issues
-/// #57/#65); for non-modifier triggers it reflects the consuming tap.
+/// capture (the tap stays listen-only for its whole life); for non-modifier
+/// triggers it reflects the consuming tap.
 @property (nonatomic, assign, readonly) BOOL canConsumeHandlerKeyEvents;
 
 /// How many number shortcuts (1..limit) the capture should swallow while

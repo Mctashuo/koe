@@ -28,38 +28,30 @@ typedef NS_ENUM(NSInteger, SPHotkeyState) {
 @property (nonatomic, strong) id globalMonitorRef;
 @property (nonatomic, strong) id localMonitorRef;
 @property (nonatomic, assign) BOOL running;
-// The CGEventTap lives on this dedicated thread. Its callback gates every
-// keyboard event in the session, so it must never run on the main thread:
-// when the main thread stalls (ASR finalization, paste, overlay work —
-// exactly when the user releases the trigger key), a main-thread tap
-// swallows in-flight modifier events. WindowServer then accumulates stale
-// modifier state for downstream consumers and emits corrective FlagsChanged
-// events (keycode 63/Fn) when the tap is destroyed at quit — other apps'
-// Fn-hotkey detectors see those as real presses (issues #57/#65).
+// The CGEventTap lives on this dedicated thread. A consuming tap's callback
+// gates every keyboard event in the session, so it must never share the
+// main thread: when the main thread stalls (ASR finalization, paste,
+// overlay work — exactly when the user releases the trigger key), a
+// main-thread tap would delay or swallow in-flight events for the whole
+// system. A dedicated thread also keeps trigger latency independent of
+// main-thread load for listen-only taps.
+// (History: the phantom-keys-at-quit bug, issues #57/#65, was long blamed
+// on tap behavior here; the actual culprit was SPPermissionManager leaking
+// its permission-probe taps — see isInputMonitoringGranted.)
 @property (nonatomic, strong) NSThread *tapThread;
 @property (nonatomic, assign) CFRunLoopRef tapRunLoop;
 @property (nonatomic, strong) dispatch_semaphore_t tapShutdownSemaphore;
-// Whether the current tap thread was started asking for an ACTIVE
-// (consuming) tap. An active tap is only requested while something actually
-// needs to swallow events: a non-modifier trigger key, or the template
-// selector's number shortcuts. The rest of the time a LISTEN-ONLY tap is
-// used: quitting Koe after long real-world use with a long-lived ACTIVE tap
-// makes WindowServer emit phantom Fn FlagsChanged events at tap teardown
-// (issues #57/#65) — a mechanism we could reproduce with Koe but never with
-// short-lived or listen-only taps.
-@property (nonatomic, assign) BOOL tapWantsActive;
-@property (nonatomic, assign, readwrite) BOOL canConsumeGlobalKeyEvents;
+// Whether the tap can consume events (an ACTIVE/filtering tap was created).
+// Internal only — callers consult canConsumeHandlerKeyEvents, which also
+// covers the Carbon capture used for modifier-only triggers.
+@property (nonatomic, assign) BOOL canConsumeGlobalKeyEvents;
 // Carbon RegisterEventHotKey capture for the template number shortcuts and
 // the raw-ASR Return accept, used whenever the trigger is modifier-only.
-// Rationale (issues #57/#65): consuming (active) CGEventTaps gate the whole
-// session keyboard stream; when their callback stalls, WindowServer
-// accumulates stale modifier state that it flushes as phantom FlagsChanged
-// (Fn) events when the tap connection dies at quit. The 1.0.21 fix made the
-// tap listen-only, but the 1.0.22 enter/number handlers re-introduced
-// mid-run upgrades to an active tap (plus teardown/recreate cycles) during
-// exactly the busiest main-thread windows — and the phantom returned.
-// Carbon hotkeys swallow keys inside WindowServer without any event tap, so
-// the tap can stay listen-only for its entire life.
+// Rationale: a consuming CGEventTap gates every keystroke in the session,
+// so a busy Koe adds latency to all typing system-wide; Carbon hotkeys
+// swallow exactly the wanted keys inside WindowServer with no tap at all,
+// letting the tap stay listen-only for its entire life on modifier-only
+// triggers. Non-modifier triggers still need the consuming tap.
 // `carbonCaptureActive` is atomic: read from the tap thread.
 @property (assign) BOOL carbonCaptureActive;
 @property (nonatomic, assign) EventHandlerRef carbonHotKeyHandler;
@@ -361,7 +353,6 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
 
 - (void)startTapThread {
     if (self.tapThread) return;
-    self.tapWantsActive = [self needsEventConsumption];
     dispatch_semaphore_t ready = dispatch_semaphore_create(0);
     self.tapShutdownSemaphore = dispatch_semaphore_create(0);
     NSThread *thread = [[NSThread alloc] initWithTarget:self
@@ -517,7 +508,7 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
         // handled events so they do not leak into the user's focused app;
         // some systems reject one tap location but allow another, so try
         // both before degrading to listen-only. When nothing needs to be
-        // consumed, go straight to listen-only (see tapWantsActive).
+        // consumed, go straight to listen-only (see needsEventConsumption).
         CGEventMask mask = CGEventMaskBit(kCGEventFlagsChanged)
                          | CGEventMaskBit(kCGEventKeyDown)
                          | CGEventMaskBit(kCGEventKeyUp);
@@ -534,7 +525,7 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
             { kCGSessionEventTap, kCGEventTapOptionListenOnly, @"[Koe] CGEventTap listening on session stream (no event consumption needed)" },
             { kCGHIDEventTap, kCGEventTapOptionListenOnly, @"[Koe] CGEventTap listening on HID stream (no event consumption needed)" },
         };
-        BOOL wantActive = self.tapWantsActive;
+        BOOL wantActive = [self needsEventConsumption];
         __typeof__(activeAttempts[0]) *attempts = wantActive ? activeAttempts : listenAttempts;
         NSUInteger attemptCount = wantActive
             ? sizeof(activeAttempts) / sizeof(activeAttempts[0])
@@ -658,7 +649,7 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
     }
     // For modifier-only triggers the digits are captured with Carbon
     // hotkeys while the template selector is visible — the tap itself
-    // stays listen-only and is never cycled (issues #57/#65).
+    // stays listen-only and is never cycled.
     if (hadHandler != hasHandler) {
         [self updateCarbonKeyCaptureIfNeeded];
     }
@@ -677,7 +668,7 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
     // thread, and the tap callback needs the consume decision synchronously.
     // Wait with a short timeout: if the main thread is too busy to answer,
     // let the key pass through rather than stall the session event stream
-    // (a stalled tap swallows events — the root cause of issues #57/#65).
+    // (a stalled consuming tap delays every keystroke in the session).
     BOOL (^handler)(NSInteger) = self.numberKeyHandler;
     __block BOOL handled = NO;
     if ([NSThread isMainThread]) {
@@ -720,7 +711,7 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
         hasHandler = (_enterKeyHandler != nil);
     }
     // Like number-key capture, the Enter accept is a Carbon hotkey while the
-    // raw-ASR fallback is armed — never a tap upgrade (issues #57/#65).
+    // raw-ASR fallback is armed — never a tap upgrade.
     if (hadHandler != hasHandler) {
         [self updateCarbonKeyCaptureIfNeeded];
     }
