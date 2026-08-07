@@ -1,7 +1,7 @@
 {
     "provider": "wetype",
     "mode": "asr",
-    "description": "WeType 离线模型",
+    "description": "WeType Offline Model",
     "repo": "model.koe.li",
     "files": [
         {
