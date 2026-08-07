@@ -68,6 +68,16 @@ static CGEventRef inputMonitoringProbeCallback(CGEventTapProxy proxy,
                                          inputMonitoringProbeCallback,
                                          NULL);
     if (tap) {
+        // CFRelease alone does NOT destroy the WindowServer side of the tap:
+        // it stays alive and ENABLED with nobody draining its queue, one more
+        // orphan per probe (startup + every status-bar menu open). Those
+        // orphans buffer a copy of every FlagsChanged in the session, and
+        // when the process finally dies WindowServer's cleanup of the wedged
+        // taps emits phantom modifier events that other apps' hotkey
+        // detectors treat as real presses (issues #57/#65 — THE phantom-keys-
+        // at-quit bug). The port must be explicitly invalidated.
+        CGEventTapEnable(tap, false);
+        CFMachPortInvalidate(tap);
         CFRelease(tap);
         return YES;
     }

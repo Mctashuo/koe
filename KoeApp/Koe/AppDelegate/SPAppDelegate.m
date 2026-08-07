@@ -96,6 +96,16 @@ static BOOL configFlagEnabledWithDefault(const char *keyPath, BOOL defaultValue)
     return enabled;
 }
 
+// Phantom-key lab switches (issues #57/#65): env flags that disable whole
+// subsystems so the arming source can be bisected with real-usage rounds.
+// KOE_LAB_NO_HOTKEY=1  -> no SPHotkeyMonitor at all (no tap/monitors/Carbon)
+// KOE_LAB_NO_AUDIO=1   -> no prepared AudioQueue (mic device not held)
+// KOE_LAB_NO_SPARKLE=1 -> no Sparkle updater
+static BOOL SPLabFlag(const char *name) {
+    const char *value = getenv(name);
+    return value && value[0] == '1';
+}
+
 - (BOOL)shouldShowPromptTemplateButtons {
     return configFlagEnabled("llm.prompt_templates_enabled");
 }
@@ -232,9 +242,13 @@ static BOOL configFlagEnabledWithDefault(const char *keyPath, BOOL defaultValue)
     self.overlayPanel.delegate = self;
 
     // Initialize Sparkle updater (feed URL and public key come from Info.plist)
-    self.updaterController = [[SPUStandardUpdaterController alloc] initWithStartingUpdater:YES
-                                                                           updaterDelegate:nil
-                                                                        userDriverDelegate:nil];
+    if (SPLabFlag("KOE_LAB_NO_SPARKLE")) {
+        NSLog(@"[Koe] LAB: Sparkle updater disabled");
+    } else {
+        self.updaterController = [[SPUStandardUpdaterController alloc] initWithStartingUpdater:YES
+                                                                               updaterDelegate:nil
+                                                                            userDriverDelegate:nil];
+    }
 
     // Request notification permission
     [self.permissionManager requestNotificationPermission];
@@ -280,20 +294,28 @@ static BOOL configFlagEnabledWithDefault(const char *keyPath, BOOL defaultValue)
 
         // Build the queue after TCC confirms microphone access, but do not
         // start hardware yet. The trigger-down path starts this prepared queue.
-        self.audioPreparationEnabled = YES;
-        if (![self prepareAudioQueueForResolvedDevice]) {
-            NSLog(@"[Koe] Initial audio queue preparation failed; trigger-down will retry");
+        if (SPLabFlag("KOE_LAB_NO_AUDIO")) {
+            NSLog(@"[Koe] LAB: audio queue preparation disabled");
+        } else {
+            self.audioPreparationEnabled = YES;
+            if (![self prepareAudioQueueForResolvedDevice]) {
+                NSLog(@"[Koe] Initial audio queue preparation failed; trigger-down will retry");
+            }
         }
 
         // Start hotkey monitor (let it try CGEventTap directly — the probe may give false negatives)
-        self.hotkeyMonitor = [[SPHotkeyMonitor alloc] initWithDelegate:self];
+        if (SPLabFlag("KOE_LAB_NO_HOTKEY")) {
+            NSLog(@"[Koe] LAB: hotkey stack disabled (no tap, no NSEvent monitors, no Carbon)");
+        } else {
+            self.hotkeyMonitor = [[SPHotkeyMonitor alloc] initWithDelegate:self];
 
-        // Apply hotkey configuration from config.yaml
-        struct SPHotkeyConfig hotkeyConfig = sp_core_get_hotkey_config();
-        [self applyHotkeyConfig:hotkeyConfig restartMonitorIfNeeded:NO];
+            // Apply hotkey configuration from config.yaml
+            struct SPHotkeyConfig hotkeyConfig = sp_core_get_hotkey_config();
+            [self applyHotkeyConfig:hotkeyConfig restartMonitorIfNeeded:NO];
 
-        [self.hotkeyMonitor start];
-        NSLog(@"[Koe] Ready — hotkey monitor active");
+            [self.hotkeyMonitor start];
+            NSLog(@"[Koe] Ready — hotkey monitor active");
+        }
 
         // Start watching config file for hotkey changes
         [self startConfigWatcher];
