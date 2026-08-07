@@ -49,6 +49,21 @@ typedef NS_ENUM(NSInteger, SPHotkeyState) {
 // short-lived or listen-only taps.
 @property (nonatomic, assign) BOOL tapWantsActive;
 @property (nonatomic, assign, readwrite) BOOL canConsumeGlobalKeyEvents;
+// Carbon RegisterEventHotKey capture for the template number shortcuts and
+// the raw-ASR Return accept, used whenever the trigger is modifier-only.
+// Rationale (issues #57/#65): consuming (active) CGEventTaps gate the whole
+// session keyboard stream; when their callback stalls, WindowServer
+// accumulates stale modifier state that it flushes as phantom FlagsChanged
+// (Fn) events when the tap connection dies at quit. The 1.0.21 fix made the
+// tap listen-only, but the 1.0.22 enter/number handlers re-introduced
+// mid-run upgrades to an active tap (plus teardown/recreate cycles) during
+// exactly the busiest main-thread windows — and the phantom returned.
+// Carbon hotkeys swallow keys inside WindowServer without any event tap, so
+// the tap can stay listen-only for its entire life.
+// `carbonCaptureActive` is atomic: read from the tap thread.
+@property (assign) BOOL carbonCaptureActive;
+@property (nonatomic, assign) EventHandlerRef carbonHotKeyHandler;
+@property (nonatomic, strong) NSMutableArray<NSValue *> *carbonHotKeyRefs;
 // Key codes whose keyUp must also be swallowed after a handled keyDown
 // (template number shortcuts and the raw-ASR-accept Return key).
 @property (nonatomic, strong) NSMutableSet<NSNumber *> *suppressedKeyCodes;
@@ -72,7 +87,10 @@ typedef NS_ENUM(NSInteger, SPHotkeyState) {
 - (BOOL)needsEventConsumption;
 - (void)startTapThread;
 - (void)stopTapThread;
-- (void)updateTapModeIfNeeded;
+- (void)updateCarbonKeyCaptureIfNeeded;
+- (void)unregisterCarbonHotKeys;
+- (void)handleCarbonHotKeyID:(UInt32)identifier;
+- (BOOL)isCarbonCapturedKeyCode:(NSInteger)keyCode;
 - (NSUInteger)currentModifierFlags;
 - (void)cancelPendingModifierRelease;
 - (void)scheduleModifierRelease;
@@ -100,6 +118,32 @@ static NSInteger numberForKeyCode(NSInteger keyCode) {
 
 static BOOL isReturnKeyCode(NSInteger keyCode) {
     return keyCode == 36 || keyCode == 76; // Return or keypad Enter
+}
+
+// ANSI key codes for digits 1-9, indexed by the digit itself (index 0 unused).
+static const UInt32 SPDigitKeyCodeForNumber[10] = {0, 18, 19, 20, 21, 23, 22, 26, 28, 25};
+
+static const OSType SPCarbonHotKeySignature = 'KOEH';
+enum {
+    // IDs 1-9 are the template digits; Return/Enter get their own IDs.
+    SPCarbonHotKeyIDReturn = 100,
+    SPCarbonHotKeyIDKeypadEnter = 101,
+};
+
+// Carbon delivers hotkey events through the main event dispatcher, so this
+// runs on the main thread — no tap, no gating of the session key stream.
+static OSStatus SPCarbonHotKeyPressed(EventHandlerCallRef nextHandler,
+                                      EventRef event,
+                                      void *userInfo) {
+    SPHotkeyMonitor *monitor = (__bridge SPHotkeyMonitor *)userInfo;
+    EventHotKeyID hotKeyID = { 0, 0 };
+    OSStatus err = GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID,
+                                     NULL, sizeof(hotKeyID), NULL, &hotKeyID);
+    if (err != noErr || hotKeyID.signature != SPCarbonHotKeySignature) {
+        return eventNotHandledErr;
+    }
+    [monitor handleCarbonHotKeyID:hotKeyID.id];
+    return noErr;
 }
 
 // Run a block on the main thread in kCFRunLoopCommonModes. Unlike
@@ -167,6 +211,15 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
             SPPerformOnMainRunLoop(^{
                 [monitor cancelDoubleTapCandidateForInterveningInput];
             });
+        }
+
+        // Keys owned by the Carbon hotkey capture (template digits, raw-ASR
+        // Return) are swallowed inside WindowServer AFTER taps observe them
+        // and are delivered to Koe as kEventHotKeyPressed. The listen-only
+        // tap must leave them alone: neither invoke the handlers (that would
+        // double-fire) nor treat them as overlay-dismissing input.
+        if ([monitor isCarbonCapturedKeyCode:keyCode]) {
+            return event;
         }
 
         // Forward number keys 1-9 if handler is set.
@@ -254,6 +307,8 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
         _canConsumeGlobalKeyEvents = NO;
         _suppressedKeyCodes = [NSMutableSet set];
         _suppressedHotkeyKeyCodes = [NSMutableSet set];
+        _numberKeyCaptureLimit = 9;
+        _carbonHotKeyRefs = [NSMutableArray array];
     }
     return self;
 }
@@ -287,17 +342,21 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
     // Also try CGEventTap as additional source, hosted on a dedicated thread
     // (see tapThread property for why it must never share the main thread).
     [self startTapThread];
+
+    // Handlers may already be installed (e.g. monitor restart after a config
+    // reload mid-session); rebuild the Carbon capture to match them.
+    [self updateCarbonKeyCaptureIfNeeded];
 }
 
 - (BOOL)needsEventConsumption {
-    // Modifier-only triggers (Fn, Option, …) never consume the trigger
-    // events; only the template selector's number shortcuts and the raw-ASR
-    // fallback's Enter accept need swallowing.
+    // Modifier-only triggers (Fn, Option, …) NEVER consume via the tap: the
+    // template number shortcuts and the raw-ASR Enter accept are swallowed
+    // with Carbon RegisterEventHotKey instead (see carbonCaptureActive), so
+    // the tap stays listen-only for its entire life — created once at start,
+    // destroyed once at stop, never upgraded or cycled mid-run.
     // Non-modifier triggers consume their keyDown/keyUp so the trigger key
     // does not leak into the focused app.
-    return ![self isModifierOnlyMatchKind:self.targetMatchKind] ||
-           self.numberKeyHandler != nil ||
-           self.enterKeyHandler != nil;
+    return ![self isModifierOnlyMatchKind:self.targetMatchKind];
 }
 
 - (void)startTapThread {
@@ -342,11 +401,114 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
     self.canConsumeGlobalKeyEvents = NO;
 }
 
-- (void)updateTapModeIfNeeded {
+#pragma mark - Carbon hotkey capture
+
+- (void)installCarbonHotKeyHandlerIfNeeded {
+    if (self.carbonHotKeyHandler) return;
+    EventTypeSpec spec = { kEventClassKeyboard, kEventHotKeyPressed };
+    EventHandlerRef handler = NULL;
+    OSStatus err = InstallEventHandler(GetEventDispatcherTarget(),
+                                       SPCarbonHotKeyPressed,
+                                       1, &spec,
+                                       (__bridge void *)self,
+                                       &handler);
+    if (err == noErr) {
+        self.carbonHotKeyHandler = handler;
+    } else {
+        NSLog(@"[Koe] InstallEventHandler for hotkey capture failed (err=%d)", (int)err);
+    }
+}
+
+- (void)registerCarbonHotKeyForKeyCode:(UInt32)keyCode identifier:(UInt32)identifier {
+    EventHotKeyID hotKeyID = { SPCarbonHotKeySignature, identifier };
+    EventHotKeyRef ref = NULL;
+    OSStatus err = RegisterEventHotKey(keyCode, 0, hotKeyID,
+                                       GetEventDispatcherTarget(), 0, &ref);
+    if (err == noErr && ref) {
+        [self.carbonHotKeyRefs addObject:[NSValue valueWithPointer:ref]];
+    } else {
+        NSLog(@"[Koe] RegisterEventHotKey failed for keyCode=%u (err=%d)", keyCode, (int)err);
+    }
+}
+
+- (void)unregisterCarbonHotKeys {
+    for (NSValue *value in self.carbonHotKeyRefs) {
+        EventHotKeyRef ref = (EventHotKeyRef)value.pointerValue;
+        if (ref) UnregisterEventHotKey(ref);
+    }
+    [self.carbonHotKeyRefs removeAllObjects];
+    self.carbonCaptureActive = NO;
+}
+
+// (Re)build the Carbon hotkey registrations from the current handler state.
+// Main thread only: Carbon registration and the handler setters both live
+// there, so carbonCaptureActive is accurate as soon as a setter returns.
+- (void)updateCarbonKeyCaptureIfNeeded {
+    if (![NSThread isMainThread]) {
+        SPPerformOnMainRunLoop(^{ [self updateCarbonKeyCaptureIfNeeded]; });
+        return;
+    }
+    [self unregisterCarbonHotKeys];
     if (!self.running) return;
-    if (self.tapWantsActive == [self needsEventConsumption]) return;
-    [self stopTapThread];
-    [self startTapThread];
+    if (![self isModifierOnlyMatchKind:self.targetMatchKind]) return;
+
+    BOOL wantsNumbers = (self.numberKeyHandler != nil);
+    BOOL wantsEnter = (self.enterKeyHandler != nil);
+    if (!wantsNumbers && !wantsEnter) return;
+
+    [self installCarbonHotKeyHandlerIfNeeded];
+    if (!self.carbonHotKeyHandler) return;
+
+    if (wantsNumbers) {
+        NSInteger limit = MIN(MAX(self.numberKeyCaptureLimit, (NSInteger)0), (NSInteger)9);
+        for (NSInteger number = 1; number <= limit; number++) {
+            [self registerCarbonHotKeyForKeyCode:SPDigitKeyCodeForNumber[number]
+                                      identifier:(UInt32)number];
+        }
+    }
+    if (wantsEnter) {
+        [self registerCarbonHotKeyForKeyCode:36 identifier:SPCarbonHotKeyIDReturn];
+        [self registerCarbonHotKeyForKeyCode:76 identifier:SPCarbonHotKeyIDKeypadEnter];
+    }
+    self.carbonCaptureActive = (self.carbonHotKeyRefs.count > 0);
+    NSLog(@"[Koe] Carbon key capture %@ (numbers=%d enter=%d registered=%lu)",
+          self.carbonCaptureActive ? @"active" : @"unavailable",
+          wantsNumbers, wantsEnter, (unsigned long)self.carbonHotKeyRefs.count);
+}
+
+- (BOOL)isCarbonCapturedKeyCode:(NSInteger)keyCode {
+    if (!self.carbonCaptureActive) return NO;
+    if (self.numberKeyHandler) {
+        NSInteger number = numberForKeyCode(keyCode);
+        NSInteger limit = MIN(MAX(self.numberKeyCaptureLimit, (NSInteger)0), (NSInteger)9);
+        if (number >= 1 && number <= limit) return YES;
+    }
+    if (self.enterKeyHandler && isReturnKeyCode(keyCode)) return YES;
+    return NO;
+}
+
+- (void)handleCarbonHotKeyID:(UInt32)identifier {
+    if (!self.running || self.suspended) return;
+    if (identifier >= 1 && identifier <= 9) {
+        BOOL (^numberHandler)(NSInteger) = self.numberKeyHandler;
+        if (numberHandler && numberHandler((NSInteger)identifier)) {
+            NSLog(@"[Koe] Carbon capture consumed digit %u", identifier);
+        }
+        return;
+    }
+    if (identifier == SPCarbonHotKeyIDReturn || identifier == SPCarbonHotKeyIDKeypadEnter) {
+        BOOL (^enterHandler)(void) = self.enterKeyHandler;
+        if (enterHandler) {
+            enterHandler();
+        }
+    }
+}
+
+- (BOOL)canConsumeHandlerKeyEvents {
+    if ([self isModifierOnlyMatchKind:self.targetMatchKind]) {
+        return self.carbonCaptureActive;
+    }
+    return self.canConsumeGlobalKeyEvents;
 }
 
 - (void)tapThreadMain:(dispatch_semaphore_t)readySemaphore {
@@ -494,15 +656,18 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
         _numberKeyHandler = [handler copy];
         hasHandler = (_numberKeyHandler != nil);
     }
-    // Number-key capture is the only reason a modifier-only trigger needs an
-    // ACTIVE tap. Upgrade while the template selector is visible; downgrade
-    // back to listen-only as soon as it goes away.
+    // For modifier-only triggers the digits are captured with Carbon
+    // hotkeys while the template selector is visible — the tap itself
+    // stays listen-only and is never cycled (issues #57/#65).
     if (hadHandler != hasHandler) {
-        [self updateTapModeIfNeeded];
+        [self updateCarbonKeyCaptureIfNeeded];
     }
 }
 
 - (BOOL)handleNumberKeyWithKeyCode:(NSInteger)keyCode {
+    // While the Carbon capture owns the digits, the tap/NSEvent copies of the
+    // same keystrokes must not invoke the handler a second time.
+    if (self.carbonCaptureActive) return NO;
     if (!self.numberKeyHandler) return NO;
 
     NSInteger number = numberForKeyCode(keyCode);
@@ -554,16 +719,17 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
         _enterKeyHandler = [handler copy];
         hasHandler = (_enterKeyHandler != nil);
     }
-    // Like number-key capture, the Enter accept needs an ACTIVE tap on
-    // modifier-only triggers. Upgrade while the raw-ASR fallback is armed;
-    // downgrade back to listen-only as soon as it goes away.
+    // Like number-key capture, the Enter accept is a Carbon hotkey while the
+    // raw-ASR fallback is armed — never a tap upgrade (issues #57/#65).
     if (hadHandler != hasHandler) {
-        [self updateTapModeIfNeeded];
+        [self updateCarbonKeyCaptureIfNeeded];
     }
 }
 
 - (BOOL)handleEnterKeyWithKeyCode:(NSInteger)keyCode {
     if (!isReturnKeyCode(keyCode)) return NO;
+    // See handleNumberKeyWithKeyCode: Carbon owns the key while active.
+    if (self.carbonCaptureActive) return NO;
     if (!self.enterKeyHandler) return NO;
 
     // Same main-thread contract and timeout rationale as
@@ -732,6 +898,7 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
         [NSEvent removeMonitor:self.localMonitorRef];
         self.localMonitorRef = nil;
     }
+    [self unregisterCarbonHotKeys];
     [self stopTapThread];
 
     BOOL hadPendingTrigger = [self hasUnconfirmedPreCapture];
@@ -1013,6 +1180,14 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
     }
     if (hadPendingTrigger) {
         [self.delegate hotkeyMonitorDidCancelTrigger];
+    }
+}
+
+- (void)dealloc {
+    [self unregisterCarbonHotKeys];
+    if (_carbonHotKeyHandler) {
+        RemoveEventHandler(_carbonHotKeyHandler);
+        _carbonHotKeyHandler = NULL;
     }
 }
 

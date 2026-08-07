@@ -134,7 +134,7 @@ static BOOL configFlagEnabledWithDefault(const char *keyPath, BOOL defaultValue)
     NSLog(@"[Koe] Prompt templates visible: %lu / %lu", (unsigned long)visibleTemplates.count, (unsigned long)templates.count);
     if (visibleTemplates.count > 0 && self.lastAsrText.length > 0) {
         [self.overlayPanel showTemplateButtons:visibleTemplates lingerDuration:lingerDuration];
-        [self startNumberKeyMonitoring];
+        [self startNumberKeyMonitoringWithVisibleCount:(NSInteger)visibleTemplates.count];
     } else {
         [self.overlayPanel lingerAndDismissWithDuration:lingerDuration];
     }
@@ -910,17 +910,17 @@ static BOOL configFlagEnabledWithDefault(const char *keyPath, BOOL defaultValue)
     self.rawAsrFallbackInteractionActive = YES;
     [self.overlayPanel setRawAsrFallbackClickEnabled:YES];
 
-    // Assign the handler first: for modifier-only triggers the monitor runs
-    // a listen-only tap and only upgrades to a consuming tap while an Enter
-    // handler is installed, so canConsumeGlobalKeyEvents is meaningful only
-    // after this assignment.
+    // Assign the handler first: installing it arms the capture backend
+    // (Carbon hotkeys for modifier-only triggers, the consuming tap
+    // otherwise), so canConsumeHandlerKeyEvents is meaningful only after
+    // this assignment.
     __weak typeof(self) weakSelf = self;
     self.hotkeyMonitor.enterKeyHandler = ^BOOL{
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return NO;
         return [strongSelf requestRawAsrFallbackFromUserAction:@"enter"];
     };
-    if (!self.hotkeyMonitor.canConsumeGlobalKeyEvents) {
+    if (!self.hotkeyMonitor.canConsumeHandlerKeyEvents) {
         self.hotkeyMonitor.enterKeyHandler = nil;
     }
 }
@@ -1130,12 +1130,14 @@ static BOOL configFlagEnabledWithDefault(const char *keyPath, BOOL defaultValue)
 
 #pragma mark - Number Key Monitoring
 
-- (void)startNumberKeyMonitoring {
+- (void)startNumberKeyMonitoringWithVisibleCount:(NSInteger)visibleCount {
     __weak typeof(self) weakSelf = self;
-    // Assign the handler first: for modifier-only triggers the monitor runs
-    // a listen-only tap and only upgrades to a consuming tap while a number
-    // handler is installed, so canConsumeGlobalKeyEvents is meaningful only
-    // after this assignment.
+    // Limit the capture to digits that actually map to a visible template so
+    // unassigned digits are never swallowed globally. Set BEFORE the handler:
+    // assigning the handler arms the capture backend (Carbon hotkeys for
+    // modifier-only triggers, the consuming tap otherwise), so
+    // canConsumeHandlerKeyEvents is meaningful only after that assignment.
+    self.hotkeyMonitor.numberKeyCaptureLimit = visibleCount;
     self.hotkeyMonitor.numberKeyHandler = ^BOOL(NSInteger number) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return NO;
@@ -1147,9 +1149,9 @@ static BOOL configFlagEnabledWithDefault(const char *keyPath, BOOL defaultValue)
         return handled;
     };
 
-    if (!self.hotkeyMonitor.canConsumeGlobalKeyEvents) {
+    if (!self.hotkeyMonitor.canConsumeHandlerKeyEvents) {
         self.hotkeyMonitor.numberKeyHandler = nil;
-        NSLog(@"[Koe] Template selector visible (click-only; global number shortcuts unavailable without an active suppressing event tap)");
+        NSLog(@"[Koe] Template selector visible (click-only; global number shortcuts unavailable)");
         return;
     }
     NSLog(@"[Koe] Template selector visible (global number shortcuts active)");
