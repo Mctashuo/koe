@@ -2,6 +2,12 @@
 
 All notable user-facing changes to Koe are documented here.
 
+## 1.0.27 - 2026-08-07
+
+### Added
+
+- **Start and stop voice input from the status bar menu.** The menu's status section now has a toggle item, so dictation still works when the global hotkey is unavailable (another app grabbed the trigger key, Accessibility permission not granted yet, …). A menu-started session behaves exactly like a hotkey-started one — same overlay, ASR, correction and paste — and either input can end it: the trigger key stops a session the menu started, and the menu stops one the trigger key started.
+
 ## 1.0.26 - 2026-08-05
 
 ### Improved

@@ -107,10 +107,18 @@ def changelog_html(version: str) -> str:
 
 
 def description_block(version: str, notes_url: str) -> str:
-    """Sparkle renders <description> HTML directly in the update dialog."""
+    """Sparkle renders <description> HTML directly in the update dialog.
+
+    A release without changelog notes is an error, not a fallback: the whole
+    point of the appcast description is showing users what changed, and a
+    silently generic item can never be fixed for people who already updated.
+    """
     notes = changelog_html(version)
     if not notes:
-        notes = '<p>See the <a href="%s">full release notes</a>.</p>' % notes_url
+        sys.exit(
+            f"CHANGELOG.md has no '## {version}' section — refusing to publish an "
+            f"appcast item without release notes. Add the section and re-run."
+        )
     # A CDATA section must not contain the ']]>' terminator.
     notes = notes.replace("]]>", "]]&gt;")
     return "\n      <description><![CDATA[\n%s\n      ]]></description>" % notes
