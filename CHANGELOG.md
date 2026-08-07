@@ -2,6 +2,18 @@
 
 All notable user-facing changes to Koe are documented here.
 
+## 1.0.28 - 2026-08-07
+
+### Changed
+
+- **The settings window has been redesigned.** Navigation moved from the top toolbar to a sidebar that groups the panes by what they configure (Recognition, Input, Text), and everything now sits on translucent cards floating over a soft diagonal gradient, in both light and dark. The window is also a fixed size instead of resizing itself to every pane, so the content no longer jumps when you switch sections — longer panes scroll — and Save/Cancel stay pinned at the bottom instead of scrolling away.
+- **LLM correction is now off by default for new installs.** A fresh install had it switched on with no API key configured, so every dictation ended in an error until you set up a profile. Turn it on in Settings → LLM once a profile has credentials. Existing installs are untouched and keep whatever the setting was.
+
+### Fixed
+
+- The ASR connection test result is visible again for the providers with a short settings form (DoubaoIME, Apple Speech, WeType). The result line was positioned for the tallest form, so for these it was drawn past the bottom of the window and a failed test appeared to do nothing.
+- The LLM profile list no longer clips the protocol subtitle under each profile name.
+
 ## 1.0.27 - 2026-08-07
 
 ### Added
