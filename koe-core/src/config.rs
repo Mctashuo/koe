@@ -2075,7 +2075,10 @@ asr:
     endpoint_silence: 1.2       # trailing silence for sentence boundary (seconds)
 
 llm:
-  enabled: true        # set to false to skip LLM correction entirely
+  # Off by default: a fresh install has no api_key below, so leaving this on
+  # would fail every dictation until the user configures a profile. Turn it on
+  # from Settings → LLM once a profile has credentials.
+  enabled: false
   prompt_templates_enabled: false  # show rewrite template buttons above the overlay after transcription
   auto_paste_processed_text: true  # paste the first LLM-processed result into the active input immediately
   active_profile: "openai"
