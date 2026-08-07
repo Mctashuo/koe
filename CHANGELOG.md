@@ -2,6 +2,12 @@
 
 All notable user-facing changes to Koe are documented here.
 
+## 1.0.29 - 2026-08-08
+
+### Fixed
+
+- **Quitting Koe should no longer trigger phantom key presses in other apps.** After long dictation sessions, quitting (or restarting for an update) could make other apps see key presses nobody made — a phantom Fn tap, or even another app's shortcut like a screenshot hotkey firing. The 1.0.21 mitigation kept Koe's keyboard listener in a passive mode that cannot cause this, but two features added in 1.0.22 — accepting the raw transcript with Return during LLM correction, and the template number shortcuts — quietly switched it back to an intercepting mode around every correction and every template window. Those keys are now captured through the system's hotkey facility instead, so the keyboard listener stays passive for its entire lifetime when the trigger is a modifier key (Fn, Option, …). The Return accept and number shortcuts work exactly as before.
+
 ## 1.0.28 - 2026-08-07
 
 ### Changed
