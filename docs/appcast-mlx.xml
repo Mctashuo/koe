@@ -5,6 +5,24 @@
     <description>Updates for the app with on-device MLX model support (Apple Silicon).</description>
     <language>en</language>
     <item>
+      <title>Version 1.0.30</title>
+      <link>https://github.com/missuo/koe/releases/tag/v1.0.30</link>
+      <description><![CDATA[
+<h3>Fixed</h3>
+<ul>
+<li><strong>The phantom key presses at quit are actually fixed this time — root cause found and proven.</strong> Since the earliest releases, Koe's Input Monitoring permission check probed by creating a system event tap and then failed to destroy it properly, leaking one orphaned, enabled tap into WindowServer at every launch <strong>and every time the status-bar menu was opened</strong>. When Koe exited, WindowServer's cleanup of each orphaned tap emitted one synthetic modifier-key event indistinguishable from real hardware input — which other apps' hotkey detectors (dictation tools, screenshot utilities) treated as real presses. Live capture confirmed the mechanism exactly: an instance with four leaked taps emitted four phantom Fn events in the same millisecond at quit, and a build with the corrected teardown emitted none. The probe now invalidates its tap port, so no orphans are ever left behind. (The 1.0.29 change was aimed at the same symptom but at the wrong mechanism; its passive-listener architecture remains, as it is good hygiene regardless.)</li>
+</ul>
+      ]]></description>
+      <sparkle:version>31</sparkle:version>
+      <sparkle:shortVersionString>1.0.30</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <pubDate>Fri, 07 Aug 2026 19:28:57 GMT</pubDate>
+      <enclosure url="https://github.com/missuo/koe/releases/download/v1.0.30/Koe-MLX-macOS-arm64.zip"
+        sparkle:edSignature="LJhlBr4P1F6NHIiVLry0s9GjNXZzDGbzcoqjKvmIUpsqLjDfqv2s1D56NyhbEXmuOaWioJjXU5R9IT2lRblLAw=="
+        length="32996321"
+        type="application/octet-stream" />
+    </item>
+    <item>
       <title>Version 1.0.29</title>
       <link>https://github.com/missuo/koe/releases/tag/v1.0.29</link>
       <description><![CDATA[
