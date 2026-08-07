@@ -2,6 +2,9 @@
 #import "SPLocalization.h"
 #import "SPOverlayPanel.h"
 #import "SPRustBridge.h"
+#import "SPSettingsSidebar.h"
+#import "SPSettingsViews.h"
+#import "SPTheme.h"
 #import <Carbon/Carbon.h>
 #import <Cocoa/Cocoa.h>
 #import <Speech/Speech.h>
@@ -524,42 +527,18 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [popup selectItem:[popup lastItem]];
 }
 
-// Pane background that follows the system appearance. Using
-// layer.backgroundColor with a static CGColor would freeze at the appearance
-// active at creation time; overriding updateLayer and resolving inside
-// performAsCurrentDrawingAppearance: ensures the colour is re-evaluated on
-// every appearance change.
-@interface SPPaneBackgroundView : NSView
+// The pane backdrop and the card surface now live in SPSettingsViews: every
+// pane floats on the window's gradient rather than painting its own opaque
+// background, and SPCardView is the shared translucent card.
+
+// Flipped document view for a pane's scrolling content area, so a pane's
+// origin is its top-left and adding content grows downward.
+@interface SPFlippedDocumentView : NSView
 @end
 
-@implementation SPPaneBackgroundView
-- (BOOL)wantsUpdateLayer {
+@implementation SPFlippedDocumentView
+- (BOOL)isFlipped {
   return YES;
-}
-- (void)updateLayer {
-  [self.effectiveAppearance performAsCurrentDrawingAppearance:^{
-    self.layer.backgroundColor = NSColor.windowBackgroundColor.CGColor;
-  }];
-}
-@end
-
-// Elevated card surface (white in light mode, dark-elevated in dark mode) with
-// a separator-coloured border. Same dynamic-layer pattern as
-// SPPaneBackgroundView.
-@interface SPCardView : NSView
-@end
-
-@implementation SPCardView
-- (BOOL)wantsUpdateLayer {
-  return YES;
-}
-- (void)updateLayer {
-  self.layer.cornerRadius = 12.0;
-  self.layer.borderWidth = 1.0;
-  [self.effectiveAppearance performAsCurrentDrawingAppearance:^{
-    self.layer.backgroundColor = NSColor.controlBackgroundColor.CGColor;
-    self.layer.borderColor = NSColor.separatorColor.CGColor;
-  }];
 }
 @end
 
@@ -662,8 +641,15 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 // ─── Window Controller ──────────────────────────────────────────────
 
 @interface SPSetupWizardWindowController () <
-    NSToolbarDelegate, NSTableViewDelegate, NSTableViewDataSource,
-    NSTextFieldDelegate, NSTextViewDelegate, NSWindowDelegate>
+    NSTableViewDelegate, NSTableViewDataSource, NSTextFieldDelegate,
+    NSTextViewDelegate, NSWindowDelegate>
+
+// Window chrome
+@property(nonatomic, strong) SPSettingsSidebarViewController *sidebar;
+@property(nonatomic, strong) NSScrollView *paneScrollView;
+@property(nonatomic, strong) NSView *paneDocumentView;
+@property(nonatomic, strong) NSTextField *pageTitleLabel;
+@property(nonatomic, strong) NSView *paneFooterView;
 
 // Current pane
 @property(nonatomic, copy) NSString *currentPaneIdentifier;
@@ -699,6 +685,9 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 @property(nonatomic, strong) NSTextField *asrEndWindowField;
 @property(nonatomic, strong) NSPopUpButton *asrOutputVariantPopup;
 @property(nonatomic, strong) NSButton *asrAccelerateCheckbox;
+
+// The card behind the ASR form. Held so it can stretch with the pane.
+@property(nonatomic, strong) NSView *asrFormCard;
 
 // Local ASR model selection
 @property(nonatomic, strong) NSPopUpButton *localModelPopup;
@@ -818,14 +807,28 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 }
 
 - (instancetype)init {
+  // One fixed size, and every pane is laid out to fill exactly this. The window
+  // used to animate its height to each pane, so the content jumped on every
+  // switch and each pane had to declare its own height; the panes now scroll
+  // inside one shape instead.
+  NSSize contentSize = SPTheme.windowContentSize;
   NSWindow *window = [[NSWindow alloc]
-      initWithContentRect:NSMakeRect(0, 0, 600, 400)
+      initWithContentRect:NSMakeRect(0, 0, contentSize.width, contentSize.height)
                 styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                          NSWindowStyleMaskMiniaturizable
+                          NSWindowStyleMaskMiniaturizable |
+                          NSWindowStyleMaskFullSizeContentView
                   backing:NSBackingStoreBuffered
                     defer:YES];
   window.title = @"Koe Settings";
-  window.toolbarStyle = NSWindowToolbarStylePreference;
+  window.titlebarAppearsTransparent = YES;
+  window.titleVisibility = NSWindowTitleHidden;
+  window.movableByWindowBackground = YES;
+  // Pinned from both sides: without the resizable mask the user cannot drag an
+  // edge, and matching min to max stops a zoom or a Stage Manager tile from
+  // resizing it either.
+  window.contentMinSize = contentSize;
+  window.contentMaxSize = contentSize;
+  [window standardWindowButton:NSWindowZoomButton].enabled = NO;
 
   self = [super initWithWindow:window];
   if (self) {
@@ -833,7 +836,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
         dispatch_queue_create("koe.model.verify", DISPATCH_QUEUE_SERIAL);
     _loadedBooleanValues = [NSMutableDictionary dictionary];
     window.delegate = self;
-    [self setupToolbar];
+    [self buildWindowChrome];
   }
   return self;
 }
@@ -848,94 +851,177 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [NSApp activateIgnoringOtherApps:YES];
 }
 
+// ─── Window Chrome ──────────────────────────────────────────────────
+
+// One diagonal gradient behind the whole window, a clear-backed sidebar on the
+// left, and on the right a scrolling content area under a fixed page title,
+// with the Save/Cancel footer pinned below it.
+- (void)buildWindowChrome {
+  SPGradientBackdropView *root = [[SPGradientBackdropView alloc]
+      initWithFrame:self.window.contentView.bounds];
+  root.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+  self.window.contentView = root;
+
+  self.sidebar = [SPSettingsSidebarViewController new];
+  NSView *sidebarView = self.sidebar.view;
+  sidebarView.translatesAutoresizingMaskIntoConstraints = NO;
+  [root addSubview:sidebarView];
+  __weak typeof(self) weakSelf = self;
+  self.sidebar.onSelect = ^(NSString *identifier) {
+    [weakSelf switchToPane:identifier];
+  };
+
+  // No divider: the content simply abuts the sidebar, both over one gradient.
+  NSView *content = [NSView new];
+  content.translatesAutoresizingMaskIntoConstraints = NO;
+  [root addSubview:content];
+
+  // The page title is chrome, not content — it stays put while the pane below
+  // it scrolls, so it never moves between panes.
+  self.pageTitleLabel = [NSTextField labelWithString:@""];
+  self.pageTitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+  self.pageTitleLabel.font = SPTheme.pageTitleFont;
+  self.pageTitleLabel.textColor = SPTheme.primaryText;
+  [content addSubview:self.pageTitleLabel];
+
+  self.paneFooterView = [self buildPaneFooter];
+  [content addSubview:self.paneFooterView];
+
+  NSScrollView *scroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+  scroll.translatesAutoresizingMaskIntoConstraints = NO;
+  scroll.hasVerticalScroller = YES;
+  scroll.drawsBackground = NO;
+  // The window uses a full-size content view, so AppKit would otherwise inset
+  // the document by the titlebar height and push the pane down under the title.
+  scroll.automaticallyAdjustsContentInsets = NO;
+  scroll.contentInsets = NSEdgeInsetsZero;
+  self.paneScrollView = scroll;
+  [content addSubview:scroll];
+
+  self.paneDocumentView = [[SPFlippedDocumentView alloc] initWithFrame:NSZeroRect];
+  scroll.documentView = self.paneDocumentView;
+
+  CGFloat margin = SPTheme.pageMargin;
+  [NSLayoutConstraint activateConstraints:@[
+    [sidebarView.topAnchor constraintEqualToAnchor:root.topAnchor],
+    [sidebarView.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
+    [sidebarView.leadingAnchor constraintEqualToAnchor:root.leadingAnchor],
+    [sidebarView.widthAnchor constraintEqualToConstant:SPTheme.sidebarWidth],
+
+    [content.topAnchor constraintEqualToAnchor:root.topAnchor],
+    [content.bottomAnchor constraintEqualToAnchor:root.bottomAnchor],
+    [content.leadingAnchor constraintEqualToAnchor:sidebarView.trailingAnchor],
+    [content.trailingAnchor constraintEqualToAnchor:root.trailingAnchor],
+
+    [self.pageTitleLabel.topAnchor constraintEqualToAnchor:content.topAnchor
+                                                  constant:SPTheme.pageTitleTopInset],
+    [self.pageTitleLabel.leadingAnchor constraintEqualToAnchor:content.leadingAnchor
+                                                      constant:margin],
+
+    [self.paneFooterView.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+    [self.paneFooterView.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+    [self.paneFooterView.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
+
+    [scroll.topAnchor constraintEqualToAnchor:self.pageTitleLabel.bottomAnchor
+                                     constant:SPTheme.pageTitleGap],
+    [scroll.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+    [scroll.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+    [scroll.bottomAnchor constraintEqualToAnchor:self.paneFooterView.topAnchor],
+  ]];
+}
+
+// Save/Cancel used to be laid out inside each pane at its bottom edge, which
+// with a scrolling pane would scroll them out of reach. They are chrome now.
+- (NSView *)buildPaneFooter {
+  NSView *footer = [NSView new];
+  footer.translatesAutoresizingMaskIntoConstraints = NO;
+
+  NSButton *saveButton = [NSButton buttonWithTitle:@"Save"
+                                            target:self
+                                            action:@selector(saveConfig:)];
+  saveButton.translatesAutoresizingMaskIntoConstraints = NO;
+  saveButton.bezelStyle = NSBezelStyleRounded;
+  saveButton.keyEquivalent = @"\r";
+  [footer addSubview:saveButton];
+
+  NSButton *cancelButton = [NSButton buttonWithTitle:@"Cancel"
+                                              target:self
+                                              action:@selector(cancelSetup:)];
+  cancelButton.translatesAutoresizingMaskIntoConstraints = NO;
+  cancelButton.bezelStyle = NSBezelStyleRounded;
+  cancelButton.keyEquivalent = @"\033";
+  [footer addSubview:cancelButton];
+
+  CGFloat margin = SPTheme.pageMargin;
+  [NSLayoutConstraint activateConstraints:@[
+    [footer.heightAnchor constraintEqualToConstant:64],
+
+    [saveButton.trailingAnchor constraintEqualToAnchor:footer.trailingAnchor
+                                              constant:-margin],
+    [saveButton.centerYAnchor constraintEqualToAnchor:footer.centerYAnchor],
+    [saveButton.widthAnchor constraintGreaterThanOrEqualToConstant:80],
+
+    [cancelButton.trailingAnchor constraintEqualToAnchor:saveButton.leadingAnchor
+                                                constant:-10],
+    [cancelButton.centerYAnchor constraintEqualToAnchor:footer.centerYAnchor],
+    [cancelButton.widthAnchor constraintGreaterThanOrEqualToConstant:80],
+  ]];
+  return footer;
+}
+
+// Width available to a pane: the content area minus the scroller's gutter.
+- (CGFloat)paneContentWidth {
+  return SPTheme.windowContentSize.width - SPTheme.sidebarWidth;
+}
+
+// The scroll view's *visible* height. A pane whose editor should fill the
+// window sizes itself to this instead of picking a fixed height, which would
+// otherwise leave dead space under it in a window that no longer resizes.
+- (CGFloat)paneViewportHeight {
+  [self.window.contentView layoutSubtreeIfNeeded];
+  CGFloat height = NSHeight(self.paneScrollView.contentView.bounds);
+  // Before the first layout pass the scroll view has no size yet; fall back to
+  // the height the fixed window geometry produces.
+  return height > 100.0 ? height : 560.0;
+}
+
+// Text editors sit directly on their card. An NSTextView draws its own opaque
+// textBackgroundColor by default, which would punch a hard white rectangle
+// through the translucent card behind it.
+- (void)styleEditorTextView:(NSTextView *)textView
+                 scrollView:(NSScrollView *)scrollView {
+  textView.drawsBackground = NO;
+  textView.textColor = SPTheme.label;
+  scrollView.drawsBackground = NO;
+  scrollView.borderType = NSNoBorder;
+  scrollView.scrollerStyle = NSScrollerStyleOverlay;
+}
+
+- (NSString *)pageTitleForPane:(NSString *)identifier {
+  if ([identifier isEqualToString:kToolbarASR])
+    return @"ASR";
+  if ([identifier isEqualToString:kToolbarLLM])
+    return @"LLM";
+  if ([identifier isEqualToString:kToolbarOverlay])
+    return @"Overlay";
+  if ([identifier isEqualToString:kToolbarHotkey])
+    return @"Controls";
+  if ([identifier isEqualToString:kToolbarDictionary])
+    return @"Dictionary";
+  if ([identifier isEqualToString:kToolbarSystemPrompt])
+    return @"Prompt";
+  if ([identifier isEqualToString:kToolbarTemplates])
+    return @"Templates";
+  if ([identifier isEqualToString:kToolbarAbout])
+    return @"About";
+  return @"";
+}
+
 - (void)windowWillClose:(NSNotification *)notification {
   [self endHotkeyRecording];
   [self hideRuntimeOverlayPreview];
 }
 
-// ─── Toolbar ────────────────────────────────────────────────────────
-
-- (void)setupToolbar {
-  NSToolbar *toolbar =
-      [[NSToolbar alloc] initWithIdentifier:@"KoeSettingsToolbar"];
-  toolbar.delegate = self;
-  toolbar.displayMode = NSToolbarDisplayModeIconAndLabel;
-  toolbar.selectedItemIdentifier = kToolbarASR;
-  self.window.toolbar = toolbar;
-}
-
-- (NSArray<NSToolbarItemIdentifier> *)toolbarAllowedItemIdentifiers:
-    (NSToolbar *)toolbar {
-  return @[
-    kToolbarASR, kToolbarLLM, kToolbarOverlay, kToolbarHotkey,
-    kToolbarDictionary, kToolbarSystemPrompt, kToolbarTemplates, kToolbarAbout
-  ];
-}
-
-- (NSArray<NSToolbarItemIdentifier> *)toolbarDefaultItemIdentifiers:
-    (NSToolbar *)toolbar {
-  return @[
-    kToolbarASR, kToolbarLLM, kToolbarOverlay, kToolbarHotkey,
-    kToolbarDictionary, kToolbarSystemPrompt, kToolbarTemplates, kToolbarAbout
-  ];
-}
-
-- (NSArray<NSToolbarItemIdentifier> *)toolbarSelectableItemIdentifiers:
-    (NSToolbar *)toolbar {
-  return @[
-    kToolbarASR, kToolbarLLM, kToolbarOverlay, kToolbarHotkey,
-    kToolbarDictionary, kToolbarSystemPrompt, kToolbarTemplates, kToolbarAbout
-  ];
-}
-
-- (NSToolbarItem *)toolbar:(NSToolbar *)toolbar
-        itemForItemIdentifier:(NSToolbarItemIdentifier)itemIdentifier
-    willBeInsertedIntoToolbar:(BOOL)flag {
-  NSToolbarItem *item =
-      [[NSToolbarItem alloc] initWithItemIdentifier:itemIdentifier];
-  item.target = self;
-  item.action = @selector(toolbarItemClicked:);
-
-  if ([itemIdentifier isEqualToString:kToolbarASR]) {
-    item.label = @"ASR";
-    item.image = [NSImage imageWithSystemSymbolName:@"mic.fill"
-                           accessibilityDescription:@"ASR"];
-  } else if ([itemIdentifier isEqualToString:kToolbarLLM]) {
-    item.label = @"LLM";
-    item.image = [NSImage imageWithSystemSymbolName:@"cpu"
-                           accessibilityDescription:@"LLM"];
-  } else if ([itemIdentifier isEqualToString:kToolbarOverlay]) {
-    item.label = @"Overlay";
-    item.image = [NSImage imageWithSystemSymbolName:@"captions.bubble"
-                           accessibilityDescription:@"Overlay"];
-  } else if ([itemIdentifier isEqualToString:kToolbarHotkey]) {
-    item.label = @"Controls";
-    item.image = [NSImage imageWithSystemSymbolName:@"slider.horizontal.3"
-                           accessibilityDescription:@"Controls"];
-  } else if ([itemIdentifier isEqualToString:kToolbarDictionary]) {
-    item.label = @"Dictionary";
-    item.image = [NSImage imageWithSystemSymbolName:@"book"
-                           accessibilityDescription:@"Dictionary"];
-  } else if ([itemIdentifier isEqualToString:kToolbarSystemPrompt]) {
-    item.label = @"Prompt";
-    item.image = [NSImage imageWithSystemSymbolName:@"text.bubble"
-                           accessibilityDescription:@"System Prompt"];
-  } else if ([itemIdentifier isEqualToString:kToolbarTemplates]) {
-    item.label = @"Templates";
-    item.image = [NSImage imageWithSystemSymbolName:@"sparkles"
-                           accessibilityDescription:@"Templates"];
-  } else if ([itemIdentifier isEqualToString:kToolbarAbout]) {
-    item.label = @"About";
-    item.image = [NSImage imageWithSystemSymbolName:@"info.circle"
-                           accessibilityDescription:@"About"];
-  }
-
-  return item;
-}
-
-- (void)toolbarItemClicked:(NSToolbarItem *)sender {
-  [self switchToPane:sender.itemIdentifier];
-}
 
 // ─── Pane Switching ─────────────────────────────────────────────────
 
@@ -980,46 +1066,61 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
     return;
 
   self.currentPaneView = paneView;
-  self.window.toolbar.selectedItemIdentifier = identifier;
+  self.pageTitleLabel.stringValue = [self pageTitleForPane:identifier];
+  [self.sidebar selectPaneIdentifier:identifier];
+  // About is the one pane with nothing to save.
+  self.paneFooterView.hidden = [identifier isEqualToString:kToolbarAbout];
 
-  // Resize window to fit pane with animation
-  NSSize paneSize = paneView.frame.size;
-  NSRect windowFrame = self.window.frame;
-  CGFloat contentHeight = paneSize.height;
-  CGFloat titleBarHeight =
-      windowFrame.size.height - [self.window.contentView frame].size.height;
-  CGFloat newHeight = contentHeight + titleBarHeight;
-  CGFloat newWidth = paneSize.width;
-
-  NSRect newFrame = NSMakeRect(
-      windowFrame.origin.x + (windowFrame.size.width - newWidth) / 2.0,
-      windowFrame.origin.y + windowFrame.size.height - newHeight, newWidth,
-      newHeight);
-
-  [self.window setFrame:newFrame display:YES animate:YES];
-
-  // Add pane to window
-  paneView.frame = [self.window.contentView bounds];
-  paneView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  [self.window.contentView addSubview:paneView];
+  [self hostPaneView:paneView];
 
   // Reload values for this pane
   [self loadValuesForPane:identifier];
 }
 
+// Place a pane inside the scrolling document. Panes lay themselves out with
+// absolute frames in a bottom-left origin, so the pane keeps its own unflipped
+// coordinate system and only the document view is flipped — its height is the
+// pane's, which is what makes a tall pane scroll instead of resizing anything.
+- (void)hostPaneView:(NSView *)paneView {
+  CGFloat width = [self paneContentWidth];
+  CGFloat height = MAX(paneView.frame.size.height,
+                       NSHeight(self.paneScrollView.contentView.bounds));
+  self.paneDocumentView.frame = NSMakeRect(0, 0, width, height);
+  paneView.frame = NSMakeRect(0, 0, width, paneView.frame.size.height);
+  paneView.autoresizingMask = NSViewWidthSizable;
+  [self.paneDocumentView addSubview:paneView];
+  // Always start a pane at its top: an inherited scroll offset from the pane
+  // before it would otherwise open the new one part-way down.
+  [self.paneDocumentView scrollPoint:NSZeroPoint];
+}
+
+// Re-host the current pane after its intrinsic height changed (the ASR pane
+// grows and shrinks with the selected provider). Only the document height
+// needs to follow — no window resize.
+- (void)refreshHostedPaneHeight {
+  if (!self.currentPaneView)
+    return;
+  [self hostPaneView:self.currentPaneView];
+}
+
 // ─── Build Panes ────────────────────────────────────────────────────
 
 - (NSView *)buildAsrPane {
-  CGFloat paneWidth = 600;
-  CGFloat contentX = 24.0;
-  CGFloat contentW = paneWidth - 48.0;
+  CGFloat paneWidth = [self paneContentWidth];
+  CGFloat contentX = SPTheme.pageMargin;
+  CGFloat contentW = paneWidth - 2.0 * contentX;
   // Label column measured from the actual strings so no label ever clips.
   CGFloat labelW = [self formLabelColumnWidthForTitles:@[
     @"Provider", @"Auth Mode", @"API Key", @"App Key", @"Access Key",
     @"Language", @"Model", @"Endpoint Silence", @"Output Variant"
   ]];
-  CGFloat fieldX = contentX + labelW + 12;
-  CGFloat fieldW = paneWidth - fieldX - 32;
+  // The form sits inside a card, so its columns are inset by the card padding.
+  CGFloat formX = contentX + SPTheme.cardPadding;
+  CGFloat fieldX = formX + labelW + 12;
+  // Capped: at the window's full width a text field would run ~500pt, which
+  // reads as a stretched form rather than a column of inputs.
+  CGFloat fieldW =
+      MIN(paneWidth - fieldX - contentX - SPTheme.cardPadding, 440.0);
   CGFloat rowH = 32;
 
   // Calculate content height (auth mode, test result, language, advanced
@@ -1027,7 +1128,6 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   CGFloat contentHeight = 450;
   NSView *pane =
       [[NSView alloc] initWithFrame:NSMakeRect(0, 0, paneWidth, contentHeight)];
-  [self applySettingsPaneBackgroundToView:pane];
 
   CGFloat y = contentHeight - 30.0;
 
@@ -1045,12 +1145,23 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
                   frame:NSMakeRect(contentX, floor(NSMinY(desc.frame) - 36.0),
                                    contentW, 20)];
   [pane addSubview:sectionTitle];
-  y = NSMinY(sectionTitle.frame) - 32.0;
+
+  // The card that every form row floats on. It is added before the rows so it
+  // stays behind them, and it is the one subview pinned to BOTH pane edges —
+  // the rows are top-anchored, so the card stretches as the pane grows and
+  // shrinks with the selected provider.
+  CGFloat formCardTop = NSMinY(sectionTitle.frame) - SPTheme.sectionHeadingGap;
+  self.asrFormCard = [self
+      surfaceCardViewWithFrame:NSMakeRect(contentX, contentX, contentW,
+                                          formCardTop - contentX)];
+  [pane addSubview:self.asrFormCard];
+
+  y = formCardTop - SPTheme.cardPadding - 22.0;
   CGFloat formStartY = y;
 
   // Provider
   [pane addSubview:[self formLabel:@"Provider"
-                             frame:NSMakeRect(contentX, y, labelW, 22)]];
+                             frame:NSMakeRect(formX, y, labelW, 22)]];
   self.asrProviderPopup =
       [[NSPopUpButton alloc] initWithFrame:NSMakeRect(fieldX, y - 2, 200, 26)
                                  pullsDown:NO];
@@ -1103,7 +1214,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 
   // Auth Mode segmented control (Doubao only)
   NSTextField *authModeLabel = [self formLabel:@"Auth Mode"
-                                         frame:NSMakeRect(contentX, y, labelW, 22)];
+                                         frame:NSMakeRect(formX, y, labelW, 22)];
   authModeLabel.tag = 1006;
   authModeLabel.hidden = YES;
   [pane addSubview:authModeLabel];
@@ -1139,7 +1250,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   self.asrApiKeyToggle.hidden = YES;
   [pane addSubview:self.asrApiKeyToggle];
   NSTextField *apiKeyLabel = [self formLabel:@"API Key"
-                                       frame:NSMakeRect(contentX, y, labelW, 22)];
+                                       frame:NSMakeRect(formX, y, labelW, 22)];
   apiKeyLabel.tag = 1007;
   apiKeyLabel.hidden = YES;
   [pane addSubview:apiKeyLabel];
@@ -1149,13 +1260,13 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
                                 placeholder:@"Volcengine App ID"];
   [pane addSubview:self.asrAppKeyField];
   NSTextField *appKeyLabel = [self formLabel:@"App Key"
-                                       frame:NSMakeRect(contentX, y, labelW, 22)];
+                                       frame:NSMakeRect(formX, y, labelW, 22)];
   appKeyLabel.tag = 1001;
   [pane addSubview:appKeyLabel];
 
   // Apple Speech locale popup (same row as App Key / Model, tag 1005)
   NSTextField *localeLabel = [self formLabel:@"Language"
-                                       frame:NSMakeRect(contentX, y, labelW, 22)];
+                                       frame:NSMakeRect(formX, y, labelW, 22)];
   localeLabel.tag = 1005;
   localeLabel.hidden = YES;
   [pane addSubview:localeLabel];
@@ -1171,7 +1282,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 
   // Row 1: Model popup + Download button (Local providers, same row as App Key)
   self.localModelLabel = [self formLabel:@"Model"
-                                   frame:NSMakeRect(contentX, y, labelW, 22)];
+                                   frame:NSMakeRect(formX, y, labelW, 22)];
   self.localModelLabel.tag = 1004;
   self.localModelLabel.hidden = YES;
   [pane addSubview:self.localModelLabel];
@@ -1273,7 +1384,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [pane addSubview:self.asrAccessKeyToggle];
   NSTextField *accessKeyLabel =
       [self formLabel:@"Access Key"
-                frame:NSMakeRect(contentX, accessKeyY, labelW, 22)];
+                frame:NSMakeRect(formX, accessKeyY, labelW, 22)];
   accessKeyLabel.tag = 1002;
   [pane addSubview:accessKeyLabel];
 
@@ -1297,7 +1408,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   self.asrQwenApiKeyToggle.hidden = YES;
   [pane addSubview:self.asrQwenApiKeyToggle];
   NSTextField *qwenKeyLabel =
-      [self formLabel:@"API Key" frame:NSMakeRect(contentX, qwenY, labelW, 22)];
+      [self formLabel:@"API Key" frame:NSMakeRect(formX, qwenY, labelW, 22)];
   qwenKeyLabel.tag = 1003;
   qwenKeyLabel.hidden = YES;
   [pane addSubview:qwenKeyLabel];
@@ -1322,7 +1433,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   self.asrGlmApiKeyToggle.hidden = YES;
   [pane addSubview:self.asrGlmApiKeyToggle];
   NSTextField *glmKeyLabel =
-      [self formLabel:@"API Key" frame:NSMakeRect(contentX, glmY, labelW, 22)];
+      [self formLabel:@"API Key" frame:NSMakeRect(formX, glmY, labelW, 22)];
   glmKeyLabel.tag = 1010;
   glmKeyLabel.hidden = YES;
   [pane addSubview:glmKeyLabel];
@@ -1347,7 +1458,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   self.asrMimoApiKeyToggle.hidden = YES;
   [pane addSubview:self.asrMimoApiKeyToggle];
   NSTextField *mimoKeyLabel =
-      [self formLabel:@"API Key" frame:NSMakeRect(contentX, mimoY, labelW, 22)];
+      [self formLabel:@"API Key" frame:NSMakeRect(formX, mimoY, labelW, 22)];
   mimoKeyLabel.tag = 1011;
   mimoKeyLabel.hidden = YES;
   [pane addSubview:mimoKeyLabel];
@@ -1360,7 +1471,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   mimoPrivacyNotice.font = [NSFont systemFontOfSize:11];
   // Measured height so the full notice is always visible; sits below the
   // test result row, growing downward.
-  CGFloat mimoNoticeW = paneWidth - fieldX - 32;
+  CGFloat mimoNoticeW = paneWidth - fieldX - SPTheme.pageMargin;
   CGFloat mimoNoticeH = [self fittingHeightForWrappingLabel:mimoPrivacyNotice
                                                       width:mimoNoticeW];
   CGFloat mimoNoticeTop = mimoY - rowH * 2 - 6;
@@ -1374,16 +1485,18 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   self.asrMimoRequiredPaneHeight =
       ceil(contentHeight - NSMinY(mimoPrivacyNotice.frame)) + 56.0;
 
-  // Test result label — positioned right after credential rows, before
-  // language. Single truncating line (the Language row sits directly below);
-  // the full message is available via tooltip.
+  // Test result label — pinned to the bottom of the form card rather than to a
+  // fixed row, because the pane's height changes with the provider: anchored to
+  // the top like the rows, it ended up below the card entirely (and off-window)
+  // for the compact providers, so a failed test reported nowhere.
   SPStatusLabel *asrTestResult = [SPStatusLabel labelWithString:@""];
   asrTestResult.lineBreakMode = NSLineBreakByTruncatingTail;
   asrTestResult.usesSingleLineMode = YES;
   self.asrTestResultLabel = asrTestResult;
   CGFloat testResultY = accessKeyY - rowH;
   self.asrTestResultLabel.frame =
-      NSMakeRect(fieldX, testResultY, paneWidth - fieldX - 24, 20);
+      NSMakeRect(formX, contentX + SPTheme.cardPadding,
+                 contentW - 2.0 * SPTheme.cardPadding, 20);
   self.asrTestResultLabel.font = [NSFont systemFontOfSize:12];
   self.asrTestResultLabel.selectable = YES;
   [pane addSubview:self.asrTestResultLabel];
@@ -1391,7 +1504,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   // Language popup (Doubao + DoubaoIME)
   CGFloat langY = testResultY - rowH;
   NSTextField *langLabel = [self formLabel:@"Language"
-                                     frame:NSMakeRect(contentX, langY, labelW, 22)];
+                                     frame:NSMakeRect(formX, langY, labelW, 22)];
   langLabel.tag = 1008;
   langLabel.hidden = YES;
   [pane addSubview:langLabel];
@@ -1444,7 +1557,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   // Advanced row 1: Endpoint Silence
   CGFloat advRowY = rowH * 2;
   NSTextField *endLabel = [self formLabel:@"Endpoint Silence"
-                                    frame:NSMakeRect(contentX, advRowY, labelW, 22)];
+                                    frame:NSMakeRect(formX, advRowY, labelW, 22)];
   [self.asrAdvancedContainer addSubview:endLabel];
   self.asrEndWindowField =
       [self formTextField:NSMakeRect(fieldX, advRowY, 80, 22)
@@ -1462,7 +1575,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   advRowY -= rowH;
   NSTextField *variantLabel =
       [self formLabel:@"Output Variant"
-                frame:NSMakeRect(contentX, advRowY, labelW, 22)];
+                frame:NSMakeRect(formX, advRowY, labelW, 22)];
   [self.asrAdvancedContainer addSubview:variantLabel];
   self.asrOutputVariantPopup = [[NSPopUpButton alloc]
       initWithFrame:NSMakeRect(fieldX, advRowY - 2, 160, 26)
@@ -1487,27 +1600,23 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   self.asrAccelerateCheckbox.font = [NSFont systemFontOfSize:12];
   [self.asrAdvancedContainer addSubview:self.asrAccelerateCheckbox];
 
-  // Save / Cancel buttons
-  [self addButtonsToPane:pane atY:16 width:paneWidth];
-
-  // Anchor everything to top of the pane except the Save/Cancel row (y=16),
-  // which stays pinned to the bottom. This lets `resizeAsrPaneToCurrentProvider`
-  // shrink/grow the pane height per provider without orphaning controls.
+  // Every control is anchored to the top of the pane, so
+  // `resizeAsrPaneToCurrentProvider` can shrink or grow the pane per provider
+  // without orphaning any of them. (Save/Cancel used to be pinned to the
+  // pane's bottom edge and needed the opposite mask; they are window chrome
+  // now, outside the pane entirely.)
   for (NSView *sub in pane.subviews) {
-    if (sub == self.asrAdvancedContainer) {
-      // Part of the form stack — must stay directly below its disclosure
-      // checkbox even though it builds low enough to look bottom-pinned.
-      sub.autoresizingMask = NSViewMinYMargin;
-    } else if (NSMinY(sub.frame) < 50) {
-      sub.autoresizingMask = NSViewMaxYMargin;
-    } else {
-      sub.autoresizingMask = NSViewMinYMargin;
-    }
+    sub.autoresizingMask = NSViewMinYMargin;
   }
+  // Both margins fixed, height free: the card's top stays under the caption and
+  // its bottom stays on the page margin however tall the pane becomes.
+  self.asrFormCard.autoresizingMask = NSViewHeightSizable;
+  // Bottom-pinned, so it tracks the card's lower edge as the pane resizes.
+  self.asrTestResultLabel.autoresizingMask = NSViewMaxYMargin;
   pane.autoresizesSubviews = YES;
 
-  // Resize pane to fit the *saved* provider's footprint so the window opens
-  // at the right height (avoids a visible resize animation on first load).
+  // Size the pane to the *saved* provider's footprint so it opens at the right
+  // height rather than reflowing on first load.
   NSString *savedProvider = configGet(@"asr.provider");
   if (savedProvider.length == 0) savedProvider = @"doubaoime";
   CGFloat initialHeight =
@@ -1520,15 +1629,20 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 }
 
 - (NSView *)buildLlmPane {
-  CGFloat paneWidth = 600;
-  CGFloat contentX = 24.0;
-  CGFloat contentW = paneWidth - 48.0;
-  CGFloat contentHeight = 632;
+  CGFloat paneWidth = [self paneContentWidth];
+  CGFloat contentX = SPTheme.pageMargin;
+  CGFloat contentW = paneWidth - 2.0 * contentX;
+  CGFloat contentHeight = [self paneViewportHeight];
 
-  // Sidebar (profile list) geometry
-  CGFloat sidebarX = 24.0;
-  CGFloat sidebarW = 160.0;
+  // The profiles area is two cards side by side: the list on the left, the
+  // selected profile's form on the right.
+  CGFloat cardPad = SPTheme.cardPadding;
+  CGFloat cardGap = 16.0;
+  CGFloat sidebarX = contentX;
+  CGFloat sidebarW = 220.0;
   CGFloat sidebarButtonsH = 28.0;
+  CGFloat detailCardX = contentX + sidebarW + cardGap;
+  CGFloat detailCardW = contentW - sidebarW - cardGap;
 
   // Detail form geometry (right of sidebar). The label column is measured
   // from the actual strings so no label ever clips.
@@ -1536,14 +1650,14 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
     @"Name", @"Type", @"Base URL", @"API Key", @"Model", @"Model List",
     @"API Path", @"Token Parameter"
   ]];
-  CGFloat detailLabelX = sidebarX + sidebarW + 16;
+  CGFloat detailLabelX = detailCardX + cardPad;
   CGFloat fieldX = detailLabelX + labelW + 8;
-  CGFloat fieldW = paneWidth - fieldX - 24;
-  CGFloat rowH = 32;
+  CGFloat fieldW =
+      MIN(detailCardX + detailCardW - cardPad - fieldX, 440.0);
+  CGFloat rowH = 30;
 
   NSView *pane =
       [[NSView alloc] initWithFrame:NSMakeRect(0, 0, paneWidth, contentHeight)];
-  [self applySettingsPaneBackgroundToView:pane];
 
   CGFloat y = contentHeight - 30.0;
 
@@ -1557,23 +1671,25 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
                            width:contentW];
   y = NSMinY(desc.frame) - 16.0;
 
-  // Enabled toggle
+  // Both switches share one card — two rows in a single surface, like the
+  // Controls pane, rather than two 48pt cards separated by a gap.
   self.llmEnabledCheckbox =
       [self settingsSwitchWithAction:@selector(llmEnabledToggled:)];
-  NSView *llmEnabledCard = [self
-      settingsToggleCardWithFrame:NSMakeRect(contentX, y - 48.0, contentW, 48.0)
-                            title:@"LLM Correction"
-                           toggle:self.llmEnabledCheckbox];
-  [pane addSubview:llmEnabledCard];
-  y = NSMinY(llmEnabledCard.frame) - 24.0;
-
   self.llmAutoPasteProcessedTextSwitch = [self settingsSwitchWithAction:NULL];
-  NSView *autoPasteCard =
-      [self settingsToggleCardWithFrame:NSMakeRect(contentX, y - 48.0, contentW, 48.0)
-                                  title:@"Auto-paste processed text"
-                                 toggle:self.llmAutoPasteProcessedTextSwitch];
-  [pane addSubview:autoPasteCard];
-  y = NSMinY(autoPasteCard.frame) - 24.0;
+  NSView *behaviourCard = [self
+      cardWithTitle:@""
+               rows:@[
+                 [self cardRowWithLabel:@"LLM Correction"
+                                control:self.llmEnabledCheckbox],
+                 [self cardRowWithLabel:@"Auto-paste processed text"
+                                control:self.llmAutoPasteProcessedTextSwitch],
+               ]
+              width:contentW];
+  CGFloat behaviourH = behaviourCard.frame.size.height;
+  behaviourCard.frame = NSMakeRect(contentX, y - behaviourH, contentW, behaviourH);
+  [pane addSubview:behaviourCard];
+  [self layoutCardRowControls:behaviourCard.subviews.firstObject width:contentW];
+  y = NSMinY(behaviourCard.frame) - SPTheme.sectionGap;
 
   NSTextField *sectionTitle = [self
       sectionTitleLabel:@"Profiles"
@@ -1581,23 +1697,36 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [pane addSubview:sectionTitle];
   y = NSMinY(sectionTitle.frame) - 16.0;
 
-  // Bottom of the profiles area — leave room for save/cancel buttons (60pt)
-  CGFloat profilesBottomY = 64.0;
+  CGFloat profilesBottomY = SPTheme.pageMargin;
   CGFloat sidebarH = y - profilesBottomY;
   CGFloat sidebarY = profilesBottomY;
 
+  // The two cards the profiles area is built on. Added before their contents so
+  // they stay behind them; both are resized to hug the form once it has been
+  // laid out (see the end of this method).
+  NSView *listCard = [self surfaceCardViewWithFrame:NSMakeRect(sidebarX, sidebarY,
+                                                               sidebarW, sidebarH)];
+  NSView *detailCard = [self surfaceCardViewWithFrame:NSMakeRect(detailCardX, sidebarY,
+                                                                 detailCardW, sidebarH)];
+  [pane addSubview:listCard];
+  [pane addSubview:detailCard];
+
   // ─── Sidebar: profile list ─────────────────────────────────────────
+  // Inset inside its card, with the +/− buttons on the card's bottom edge.
   NSScrollView *scroll = [[NSScrollView alloc]
-      initWithFrame:NSMakeRect(sidebarX, sidebarY + sidebarButtonsH, sidebarW,
-                               sidebarH - sidebarButtonsH)];
+      initWithFrame:NSMakeRect(sidebarX + 10, sidebarY + sidebarButtonsH + 10,
+                               sidebarW - 20,
+                               sidebarH - sidebarButtonsH - 10 - cardPad)];
   scroll.hasVerticalScroller = YES;
   scroll.hasHorizontalScroller = NO;
-  scroll.borderType = NSBezelBorder;
+  scroll.borderType = NSNoBorder;
+  scroll.drawsBackground = NO;
   scroll.autohidesScrollers = YES;
   self.llmProfileTableScroll = scroll;
 
   NSTableView *table = [[NSTableView alloc] initWithFrame:scroll.bounds];
   table.headerView = nil;
+  table.backgroundColor = NSColor.clearColor;
   table.rowHeight = 44;
   table.allowsEmptySelection = NO;
   table.allowsMultipleSelection = NO;
@@ -1608,7 +1737,9 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 
   NSTableColumn *col =
       [[NSTableColumn alloc] initWithIdentifier:@"LlmProfileColumn"];
-  col.width = sidebarW - 4;
+  // The column has to fit the scroll view's content width, not the card's —
+  // anything wider scrolls horizontally and clips the profile subtitle.
+  col.width = NSWidth(scroll.frame) - 4;
   col.resizingMask = NSTableColumnAutoresizingMask;
   [table addTableColumn:col];
 
@@ -1616,9 +1747,9 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [pane addSubview:scroll];
   self.llmProfileTableView = table;
 
-  // Sidebar +/- buttons (Finder-style)
-  self.llmAddProfileButton =
-      [[NSButton alloc] initWithFrame:NSMakeRect(sidebarX, sidebarY, 28, 24)];
+  // Sidebar +/- buttons (Finder-style), on the card's bottom edge
+  self.llmAddProfileButton = [[NSButton alloc]
+      initWithFrame:NSMakeRect(sidebarX + 10, sidebarY + cardPad - 12, 28, 24)];
   self.llmAddProfileButton.bezelStyle = NSBezelStyleSmallSquare;
   self.llmAddProfileButton.image = [NSImage imageWithSystemSymbolName:@"plus"
                                              accessibilityDescription:@"Add"];
@@ -1627,7 +1758,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [pane addSubview:self.llmAddProfileButton];
 
   self.llmDeleteProfileButton = [[NSButton alloc]
-      initWithFrame:NSMakeRect(sidebarX + 30, sidebarY, 28, 24)];
+      initWithFrame:NSMakeRect(sidebarX + 40, sidebarY + cardPad - 12, 28, 24)];
   self.llmDeleteProfileButton.bezelStyle = NSBezelStyleSmallSquare;
   self.llmDeleteProfileButton.image =
       [NSImage imageWithSystemSymbolName:@"minus"
@@ -1637,7 +1768,9 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [pane addSubview:self.llmDeleteProfileButton];
 
   // ─── Detail form (right side) ─────────────────────────────────────
-  CGFloat detailY = y; // top of form area aligns with top of sidebar
+  // Inset from the card's top edge by its padding, so the first row does not
+  // sit flush against it.
+  CGFloat detailY = y - cardPad - 22.0;
 
   // Name field (editable custom display name for this profile)
   NSTextField *nameLabel =
@@ -1799,13 +1932,18 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   NSTextField *tokenHint = [self
       descriptionLabel:@"GPT-4o and older models use max_tokens. GPT-5 and "
                        @"reasoning models (o1/o3) use max_completion_tokens."];
+  // The hint spans the card's full inner width, not just the field column —
+  // at the field width it wraps to three lines and pushes the button out.
+  CGFloat tokenHintW = detailCardX + detailCardW - cardPad - detailLabelX;
   CGFloat tokenHintH = [self fittingHeightForWrappingLabel:tokenHint
-                                                     width:fieldW];
-  tokenHint.frame = NSMakeRect(fieldX, detailY - 10.0 - tokenHintH, fieldW,
-                               tokenHintH);
+                                                     width:tokenHintW];
+  tokenHint.frame = NSMakeRect(detailLabelX, detailY - 10.0 - tokenHintH,
+                               tokenHintW, tokenHintH);
   tokenHint.tag = 2007;
   [pane addSubview:tokenHint];
-  detailY = NSMinY(tokenHint.frame) - 40.0;
+  // The button's frame origin is its BOTTOM edge, so the gap below the hint is
+  // this offset minus the button's own 28pt height.
+  detailY = NSMinY(tokenHint.frame) - 16.0 - 28.0;
 
   // Test button
   self.llmTestButton = [NSButton buttonWithTitle:@"Test Connection"
@@ -1820,8 +1958,10 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   SPStatusLabel *llmTestResult = [SPStatusLabel wrappingLabelWithString:@""];
   llmTestResult.growsDownward = YES;
   self.llmTestResultLabel = llmTestResult;
+  // Two lines are reserved so a typical result stays inside the card; the label
+  // keeps its top edge and re-measures downward for anything longer.
   self.llmTestResultLabel.frame =
-      NSMakeRect(fieldX, detailY - 8.0 - 42.0, fieldW, 42);
+      NSMakeRect(fieldX, detailY - 8.0 - 32.0, fieldW, 32.0);
   self.llmTestResultLabel.font = [NSFont systemFontOfSize:12];
   self.llmTestResultLabel.selectable = YES;
   self.llmTestResultLabel.tag = 2008;
@@ -1916,16 +2056,49 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   self.llmModelProgressSizeLabel.hidden = YES;
   [pane addSubview:self.llmModelProgressSizeLabel];
 
-  // Save / Cancel buttons
-  [self addButtonsToPane:pane atY:16 width:paneWidth];
+  // Shrink both cards to hug the form. Sized to the whole available height they
+  // put ~120pt of empty card under the last row while the first row sat one
+  // padding below the top edge — all the slack collected at the bottom. The
+  // measurement includes rows that are hidden for the current profile type, so
+  // the card does not jump when a different one is selected.
+  CGFloat lowestFormEdge = CGFLOAT_MAX;
+  for (NSView *sub in pane.subviews) {
+    if (sub == listCard || sub == detailCard)
+      continue;
+    if (NSMinX(sub.frame) < detailCardX - 1.0)
+      continue; // list side, or the page-wide header rows
+    lowestFormEdge = MIN(lowestFormEdge, NSMinY(sub.frame));
+  }
+  if (lowestFormEdge < CGFLOAT_MAX) {
+    // Only ever shrinks: clamped at the page margin so a form that already
+    // fills the card cannot push the cards below the pane.
+    CGFloat cardBottom =
+        MAX(profilesBottomY, floor(lowestFormEdge - cardPad));
+    CGFloat cardHeight = NSMaxY(detailCard.frame) - cardBottom;
+    detailCard.frame =
+        NSMakeRect(detailCardX, cardBottom, detailCardW, cardHeight);
+    // The list card matches so the pair reads as one row of cards.
+    listCard.frame = NSMakeRect(sidebarX, cardBottom, sidebarW, cardHeight);
+    NSRect scrollFrame = scroll.frame;
+    scrollFrame.origin.y = cardBottom + sidebarButtonsH + 10.0;
+    scrollFrame.size.height =
+        NSMaxY(listCard.frame) - cardPad - NSMinY(scrollFrame);
+    scroll.frame = scrollFrame;
+    NSRect addFrame = self.llmAddProfileButton.frame;
+    addFrame.origin.y = cardBottom + cardPad - 12.0;
+    self.llmAddProfileButton.frame = addFrame;
+    NSRect deleteFrame = self.llmDeleteProfileButton.frame;
+    deleteFrame.origin.y = addFrame.origin.y;
+    self.llmDeleteProfileButton.frame = deleteFrame;
+  }
 
   return pane;
 }
 
 - (NSView *)buildOverlayPane {
-  CGFloat paneWidth = 600.0;
-  CGFloat contentX = 24.0;
-  CGFloat contentW = paneWidth - 48.0;
+  CGFloat paneWidth = [self paneContentWidth];
+  CGFloat contentX = SPTheme.pageMargin;
+  CGFloat contentW = paneWidth - 2.0 * contentX;
   NSString *descriptionText =
       @"Adjust the bottom live transcript overlay. Choose a system font, tune "
       @"text size, set the bottom distance, and decide whether long live text "
@@ -1966,7 +2139,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   resetButton.frame = NSMakeRect(0, 0, 126.0, 28.0);
 
   NSView *controlsCard = [self
-      cardWithTitle:@"Overlay"
+      cardWithTitle:@"Style Controls"
                rows:@[
                  [self cardRowWithLabel:@"Font"
                                 control:self.overlayFontFamilyPopup],
@@ -1983,12 +2156,12 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   CGFloat descriptionHeight = [self
       fittingHeightForWrappingLabel:[self descriptionLabel:descriptionText]
                               width:contentW];
-  CGFloat paneHeight = 30.0 + descriptionHeight + 18.0 + 20.0 + 12.0 +
-                       controlsCard.frame.size.height + 60.0;
+  // The card carries its own section caption, so no separate heading here.
+  CGFloat paneHeight = 30.0 + descriptionHeight + 18.0 +
+                       controlsCard.frame.size.height + 30.0;
 
   NSView *pane =
       [[NSView alloc] initWithFrame:NSMakeRect(0, 0, paneWidth, paneHeight)];
-  [self applySettingsPaneBackgroundToView:pane];
 
   CGFloat y = paneHeight - 30.0;
   NSTextField *desc = [self addSettingsDescriptionText:descriptionText
@@ -1998,15 +2171,9 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
                                                  width:contentW];
   y = NSMinY(desc.frame) - 18.0;
 
-  CGFloat controlsTitleY = y - 20.0;
-  NSTextField *controlsTitle = [self
-      sectionTitleLabel:@"Style Controls"
-                  frame:NSMakeRect(contentX, controlsTitleY, contentW, 20.0)];
-  [pane addSubview:controlsTitle];
-  controlsCard.frame = NSMakeRect(contentX,
-                                  NSMinY(controlsTitle.frame) - 12.0 -
-                                      controlsCard.frame.size.height,
-                                  contentW, controlsCard.frame.size.height);
+  controlsCard.frame =
+      NSMakeRect(contentX, y - controlsCard.frame.size.height, contentW,
+                 controlsCard.frame.size.height);
   [pane addSubview:controlsCard];
   NSView *controlsCardBody = controlsCard.subviews.count > 1
                                  ? controlsCard.subviews[1]
@@ -2014,7 +2181,6 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [self layoutCardRowControls:controlsCardBody width:contentW];
   [self updateOverlayLineLimitControlsEnabled];
 
-  [self addButtonsToPane:pane atY:16 width:paneWidth];
 
   return pane;
 }
@@ -2095,8 +2261,8 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 }
 
 - (NSView *)buildHotkeyPane {
-  CGFloat paneWidth = 600;
-  CGFloat cardWidth = paneWidth - 48;
+  CGFloat paneWidth = [self paneContentWidth];
+  CGFloat cardWidth = paneWidth - 2.0 * SPTheme.pageMargin;
   CGFloat cardSpacing = 16.0;
   CGFloat topPad = 24.0;
 
@@ -2202,7 +2368,6 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 
   NSView *pane =
       [[NSView alloc] initWithFrame:NSMakeRect(0, 0, paneWidth, contentHeight)];
-  [self applySettingsPaneBackgroundToView:pane];
 
   CGFloat y = contentHeight - topPad;
 
@@ -2239,7 +2404,6 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
                                   : recordingCard.subviews[0];
   [self layoutCardRowControls:recordingCardBody width:cardWidth];
 
-  [self addButtonsToPane:pane atY:16 width:paneWidth];
 
   return pane;
 }
@@ -2460,13 +2624,12 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 }
 
 - (NSView *)buildDictionaryPane {
-  CGFloat paneWidth = 600;
-  CGFloat contentHeight = 440;
+  CGFloat paneWidth = [self paneContentWidth];
+  CGFloat contentHeight = [self paneViewportHeight];
   NSView *pane =
       [[NSView alloc] initWithFrame:NSMakeRect(0, 0, paneWidth, contentHeight)];
-  [self applySettingsPaneBackgroundToView:pane];
-  CGFloat contentX = 24.0;
-  CGFloat contentW = paneWidth - 48.0;
+  CGFloat contentX = SPTheme.pageMargin;
+  CGFloat contentW = paneWidth - 2.0 * contentX;
 
   CGFloat y = contentHeight - 30.0;
 
@@ -2488,7 +2651,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [pane addSubview:sectionTitle];
 
   // Text editor
-  CGFloat editorCardY = 56.0;
+  CGFloat editorCardY = SPTheme.pageMargin;
   CGFloat editorTopY = NSMinY(sectionTitle.frame) - 12.0;
   CGFloat editorHeight = editorTopY - editorCardY;
   NSView *editorCard =
@@ -2519,23 +2682,22 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
       [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular];
   self.dictionaryTextView.allowsUndo = YES;
 
+  [self styleEditorTextView:self.dictionaryTextView scrollView:scrollView];
   scrollView.documentView = self.dictionaryTextView;
   [editorCard addSubview:scrollView];
 
   // Save / Cancel buttons
-  [self addButtonsToPane:pane atY:16 width:paneWidth];
 
   return pane;
 }
 
 - (NSView *)buildSystemPromptPane {
-  CGFloat paneWidth = 600;
-  CGFloat contentHeight = 440;
+  CGFloat paneWidth = [self paneContentWidth];
+  CGFloat contentHeight = [self paneViewportHeight];
   NSView *pane =
       [[NSView alloc] initWithFrame:NSMakeRect(0, 0, paneWidth, contentHeight)];
-  [self applySettingsPaneBackgroundToView:pane];
-  CGFloat contentX = 24.0;
-  CGFloat contentW = paneWidth - 48.0;
+  CGFloat contentX = SPTheme.pageMargin;
+  CGFloat contentW = paneWidth - 2.0 * contentX;
 
   CGFloat y = contentHeight - 30.0;
 
@@ -2555,7 +2717,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [pane addSubview:sectionTitle];
 
   // Text editor
-  CGFloat editorCardY = 56.0;
+  CGFloat editorCardY = SPTheme.pageMargin;
   CGFloat editorTopY = NSMinY(sectionTitle.frame) - 12.0;
   CGFloat editorHeight = editorTopY - editorCardY;
   NSView *editorCard =
@@ -2586,11 +2748,11 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
       [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular];
   self.systemPromptTextView.allowsUndo = YES;
 
+  [self styleEditorTextView:self.systemPromptTextView scrollView:scrollView];
   scrollView.documentView = self.systemPromptTextView;
   [editorCard addSubview:scrollView];
 
   // Save / Cancel buttons
-  [self addButtonsToPane:pane atY:16 width:paneWidth];
 
   return pane;
 }
@@ -2598,14 +2760,13 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 // ─── Templates Pane ────────────────────────────────────────────────
 
 - (NSView *)buildTemplatesPane {
-  CGFloat paneWidth = 600;
-  CGFloat contentHeight = 568;
+  CGFloat paneWidth = [self paneContentWidth];
+  CGFloat contentHeight = [self paneViewportHeight];
   NSView *pane =
       [[NSView alloc] initWithFrame:NSMakeRect(0, 0, paneWidth, contentHeight)];
-  [self applySettingsPaneBackgroundToView:pane];
 
-  CGFloat contentX = 24.0;
-  CGFloat contentW = paneWidth - 48.0;
+  CGFloat contentX = SPTheme.pageMargin;
+  CGFloat contentW = paneWidth - 2.0 * contentX;
   CGFloat y = contentHeight - 30.0;
 
   NSTextField *desc =
@@ -2626,9 +2787,9 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [pane addSubview:visibilityCard];
 
   CGFloat sectionTitleY = NSMinY(visibilityCard.frame) - 44.0;
-  CGFloat mainCardY = 60.0;
+  CGFloat mainCardY = SPTheme.pageMargin;
   CGFloat mainCardH = sectionTitleY - mainCardY - 12.0;
-  CGFloat listW = 214.0;
+  CGFloat listW = 260.0;
   CGFloat cardGap = 16.0;
   CGFloat editorW = contentW - listW - cardGap;
   CGFloat editorX = contentX + listW + cardGap;
@@ -2657,9 +2818,8 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   CGFloat footerH = 34.0;
 
   NSTextField *libraryCaption = [NSTextField labelWithString:@"Templates"];
-  libraryCaption.font = [NSFont systemFontOfSize:14
-                                          weight:NSFontWeightSemibold];
-  libraryCaption.textColor = NSColor.labelColor;
+  libraryCaption.font = SPTheme.cardTitleFont;
+  libraryCaption.textColor = SPTheme.primaryText;
   libraryCaption.frame = NSMakeRect(14, mainCardH - headerH + 9, 120, 18);
   [listCard addSubview:libraryCaption];
 
@@ -2791,11 +2951,11 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
       [NSFont monospacedSystemFontOfSize:12 weight:NSFontWeightRegular];
   self.templatePromptTextView.allowsUndo = YES;
   self.templatePromptTextView.delegate = self;
+  [self styleEditorTextView:self.templatePromptTextView scrollView:promptScroll];
   promptScroll.documentView = self.templatePromptTextView;
   [editorCard addSubview:promptScroll];
 
   // Save / Cancel buttons
-  [self addButtonsToPane:pane atY:16 width:paneWidth];
 
   return pane;
 }
@@ -3387,7 +3547,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 }
 
 - (NSView *)buildAboutPane {
-  CGFloat paneWidth = 600;
+  CGFloat paneWidth = [self paneContentWidth];
   // Measure the description first — the pane height grows to fit it.
   NSTextField *desc = [self
       descriptionLabel:@"A background-first macOS voice input tool.\nPress a "
@@ -3399,7 +3559,6 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   CGFloat contentHeight = 308 + MAX(0.0, descH - 40.0) + 132.0;
   NSView *pane =
       [[NSView alloc] initWithFrame:NSMakeRect(0, 0, paneWidth, contentHeight)];
-  [self applySettingsPaneBackgroundToView:pane];
 
   CGFloat y = contentHeight - 36;
 
@@ -3487,43 +3646,20 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 
 // ─── Shared button bar ──────────────────────────────────────────────
 
-- (void)addButtonsToPane:(NSView *)pane
-                     atY:(CGFloat)y
-                   width:(CGFloat)paneWidth {
-  NSButton *saveButton = [NSButton buttonWithTitle:@"Save"
-                                            target:self
-                                            action:@selector(saveConfig:)];
-  saveButton.bezelStyle = NSBezelStyleRounded;
-  saveButton.keyEquivalent = @"\r";
-  saveButton.frame = NSMakeRect(paneWidth - 32 - 80, y, 80, 28);
-  [pane addSubview:saveButton];
-
-  NSButton *cancelButton = [NSButton buttonWithTitle:@"Cancel"
-                                              target:self
-                                              action:@selector(cancelSetup:)];
-  cancelButton.bezelStyle = NSBezelStyleRounded;
-  cancelButton.keyEquivalent = @"\033";
-  cancelButton.frame = NSMakeRect(paneWidth - 32 - 80 - 88, y, 80, 28);
-  [pane addSubview:cancelButton];
-}
-
 // ─── UI Helpers ─────────────────────────────────────────────────────
 
 - (NSTextField *)formLabel:(NSString *)title frame:(NSRect)frame {
   NSTextField *label = [NSTextField labelWithString:title];
   label.frame = frame;
   label.alignment = NSTextAlignmentRight;
-  label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
-  label.textColor = [NSColor labelColor];
+  label.font = [SPTheme formLabelFont];
+  label.textColor = SPTheme.label;
   return label;
 }
 
 // Width of the label column needed so none of the given form labels clip.
 - (CGFloat)formLabelColumnWidthForTitles:(NSArray<NSString *> *)titles {
-  NSDictionary *attrs = @{
-    NSFontAttributeName : [NSFont systemFontOfSize:13
-                                            weight:NSFontWeightMedium]
-  };
+  NSDictionary *attrs = @{NSFontAttributeName : [SPTheme formLabelFont]};
   CGFloat width = 0.0;
   for (NSString *title in titles)
     width = MAX(width, ceil([title sizeWithAttributes:attrs].width));
@@ -3723,8 +3859,8 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 
 - (NSTextField *)descriptionLabel:(NSString *)text {
   NSTextField *label = [NSTextField wrappingLabelWithString:text];
-  label.font = [NSFont systemFontOfSize:12];
-  label.textColor = [NSColor secondaryLabelColor];
+  label.font = SPTheme.descriptionFont;
+  label.textColor = SPTheme.secondaryLabel;
   return label;
 }
 
@@ -3750,9 +3886,13 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 
 - (NSTextField *)settingsRowLabelWithString:(NSString *)text {
   NSTextField *label = [NSTextField labelWithString:text];
-  label.font = [NSFont systemFontOfSize:13 weight:NSFontWeightRegular];
-  label.textColor = NSColor.labelColor;
+  label.font = SPTheme.bodyFont;
+  label.textColor = SPTheme.label;
+  // A label's intrinsic width is its whole string, which Auto Layout treats as
+  // near-required — a long row title would widen its card instead of eliding.
   label.lineBreakMode = NSLineBreakByTruncatingTail;
+  [label setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow
+                                  forOrientation:NSLayoutConstraintOrientationHorizontal];
   return label;
 }
 
@@ -3803,18 +3943,9 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
                                 }];
 }
 
-- (void)applySettingsPaneBackgroundToView:(NSView *)pane {
-  SPPaneBackgroundView *bg =
-      [[SPPaneBackgroundView alloc] initWithFrame:pane.bounds];
-  bg.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
-  [pane addSubview:bg positioned:NSWindowBelow relativeTo:nil];
-}
-
 - (NSTextField *)sectionTitleLabel:(NSString *)title frame:(NSRect)frame {
-  NSTextField *label = [NSTextField labelWithString:title.uppercaseString];
+  SPCaptionLabel *label = [SPCaptionLabel captionWithString:title];
   label.frame = frame;
-  label.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
-  label.textColor = NSColor.secondaryLabelColor;
   return label;
 }
 
@@ -3881,21 +4012,22 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
                      rows:(NSArray<NSView *> *)rows
                     width:(CGFloat)width {
   CGFloat rowHeight = 44.0;
-  CGFloat cardPad = 16.0;
+  CGFloat cardPad = SPTheme.cardPadding;
 
   CGFloat cardHeight = rows.count * rowHeight;
-  CGFloat titleHeight = title.length > 0 ? 28.0 : 0.0;
+  // Section heading → card is 12; the caption itself is 20 tall.
+  CGFloat titleHeight = title.length > 0 ? 20.0 + SPTheme.sectionHeadingGap : 0.0;
   CGFloat totalHeight = titleHeight + cardHeight;
 
   NSView *container =
       [[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, totalHeight)];
 
   if (title.length > 0) {
-    NSTextField *titleLabel =
-        [NSTextField labelWithString:title.uppercaseString];
-    titleLabel.font = [NSFont systemFontOfSize:12 weight:NSFontWeightSemibold];
-    titleLabel.textColor = NSColor.secondaryLabelColor;
-    titleLabel.frame = NSMakeRect(cardPad, cardHeight, width - 2 * cardPad, 20);
+    // The caption sits outside the card, aligned to the page margin rather than
+    // the card's inner padding.
+    SPCaptionLabel *titleLabel = [SPCaptionLabel captionWithString:title];
+    titleLabel.frame =
+        NSMakeRect(2.0, cardHeight + SPTheme.sectionHeadingGap, width - 4.0, 20);
     [container addSubview:titleLabel];
   }
 
@@ -3910,10 +4042,13 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
     [card addSubview:row];
 
     if (i < rows.count - 1) {
-      NSBox *sep = [[NSBox alloc]
+      NSView *separator = [[NSView alloc]
           initWithFrame:NSMakeRect(cardPad, rowY, width - 2 * cardPad, 1)];
-      sep.boxType = NSBoxSeparator;
-      [card addSubview:sep];
+      separator.wantsLayer = YES;
+      [separator.effectiveAppearance performAsCurrentDrawingAppearance:^{
+        separator.layer.backgroundColor = SPTheme.separator.CGColor;
+      }];
+      [card addSubview:separator];
     }
   }
 
@@ -3922,12 +4057,10 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 
 - (NSView *)cardRowWithLabel:(NSString *)label control:(NSView *)control {
   CGFloat rowHeight = 44.0;
-  CGFloat pad = 16.0;
+  CGFloat pad = SPTheme.cardPadding;
   NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 100, rowHeight)];
 
-  NSTextField *lbl = [NSTextField labelWithString:label];
-  lbl.font = [NSFont systemFontOfSize:13 weight:NSFontWeightRegular];
-  lbl.textColor = NSColor.labelColor;
+  NSTextField *lbl = [self settingsRowLabelWithString:label];
   lbl.frame = NSMakeRect(pad, (rowHeight - 20) / 2.0, 200, 20);
   [row addSubview:lbl];
 
@@ -3943,7 +4076,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 }
 
 - (void)layoutCardRowControls:(NSView *)card width:(CGFloat)width {
-  CGFloat pad = 16.0;
+  CGFloat pad = SPTheme.cardPadding;
   for (NSView *row in card.subviews) {
     NSView *control = nil;
     for (NSView *sub in row.subviews) {
@@ -4120,32 +4253,39 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 // provider is selected. The pane is built at the maximum footprint (Doubao +
 // advanced expanded) and then sized down via autoresizing here — Save/Cancel
 // stick to the bottom edge, everything else sticks to the top.
+// Height of the strip kept clear at the bottom of the ASR form card for the
+// bottom-pinned test-result line, so no provider's last row lands on top of it.
+static const CGFloat kAsrStatusStripHeight = 34.0;
+
+// Each provider shows a different set of rows, so each needs a different slice
+// of the card. The rows are top-anchored, so a taller pane pushes them further
+// from the status strip, never into it.
 - (CGFloat)targetAsrPaneHeightForProvider:(NSString *)provider
                          advancedExpanded:(BOOL)expanded {
+  CGFloat rows;
   if ([provider isEqualToString:@"doubaoime"]) {
-    return 220.0;
+    rows = 180.0;
+  } else if ([provider isEqualToString:@"qwen"] ||
+             [provider isEqualToString:@"glm"]) {
+    rows = 300.0;
+  } else if ([provider isEqualToString:@"mimo"]) {
+    // Taller than GLM to fit the privacy notice under the API key row. The
+    // exact height is measured at pane-build time from the notice text.
+    return MAX(320.0, self.asrMimoRequiredPaneHeight) + kAsrStatusStripHeight;
+  } else if ([provider isEqualToString:@"apple-speech"]) {
+    rows = 240.0;
+  } else if ([provider isEqualToString:@"doubao"]) {
+    rows = expanded ? 460.0 : 370.0;
+  } else {
+    // mlx, sherpa-onnx — model row + status + progress
+    rows = 300.0;
   }
-  if ([provider isEqualToString:@"qwen"]) {
-    return 340.0;
-  }
-  if ([provider isEqualToString:@"glm"]) {
-    return 340.0;
-  }
-  if ([provider isEqualToString:@"mimo"]) {
-    // Taller than GLM to fit the privacy notice under the API key row.
-    // The exact height is measured at pane-build time from the notice text.
-    return MAX(360.0, self.asrMimoRequiredPaneHeight);
-  }
-  if ([provider isEqualToString:@"apple-speech"]) {
-    return 280.0;
-  }
-  if ([provider isEqualToString:@"doubao"]) {
-    return expanded ? 500.0 : 410.0;
-  }
-  // mlx, sherpa-onnx — model row + status + progress
-  return 340.0;
+  return rows + kAsrStatusStripHeight;
 }
 
+// Each provider needs a different amount of the pane. The window no longer
+// follows — it is a fixed shape — so only the pane and the scroll document it
+// sits in are resized.
 - (void)resizeAsrPaneToCurrentProvider {
   if (!self.currentPaneView) return;
   if (![self.currentPaneIdentifier isEqualToString:kToolbarASR]) return;
@@ -4159,17 +4299,11 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
       [self targetAsrPaneHeightForProvider:provider
                           advancedExpanded:advExpanded];
 
-  NSRect windowFrame = self.window.frame;
-  CGFloat titleBarHeight =
-      windowFrame.size.height - self.window.contentView.frame.size.height;
-  CGFloat newHeight = targetHeight + titleBarHeight;
-  if (fabs(windowFrame.size.height - newHeight) < 1.0) return;
-
-  NSRect newFrame = NSMakeRect(
-      windowFrame.origin.x,
-      windowFrame.origin.y + windowFrame.size.height - newHeight,
-      windowFrame.size.width, newHeight);
-  [self.window setFrame:newFrame display:YES animate:YES];
+  NSRect paneFrame = self.currentPaneView.frame;
+  if (fabs(paneFrame.size.height - targetHeight) < 1.0) return;
+  paneFrame.size.height = targetHeight;
+  self.currentPaneView.frame = paneFrame;
+  [self refreshHostedPaneHeight];
 }
 
 - (void)asrProviderChanged:(NSPopUpButton *)sender {
