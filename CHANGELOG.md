@@ -2,6 +2,12 @@
 
 All notable user-facing changes to Koe are documented here.
 
+## 1.0.30 - 2026-08-08
+
+### Fixed
+
+- **The phantom key presses at quit are actually fixed this time — root cause found and proven.** Since the earliest releases, Koe's Input Monitoring permission check probed by creating a system event tap and then failed to destroy it properly, leaking one orphaned, enabled tap into WindowServer at every launch **and every time the status-bar menu was opened**. When Koe exited, WindowServer's cleanup of each orphaned tap emitted one synthetic modifier-key event indistinguishable from real hardware input — which other apps' hotkey detectors (dictation tools, screenshot utilities) treated as real presses. Live capture confirmed the mechanism exactly: an instance with four leaked taps emitted four phantom Fn events in the same millisecond at quit, and a build with the corrected teardown emitted none. The probe now invalidates its tap port, so no orphans are ever left behind. (The 1.0.29 change was aimed at the same symptom but at the wrong mechanism; its passive-listener architecture remains, as it is good hygiene regardless.)
+
 ## 1.0.29 - 2026-08-08
 
 ### Fixed
