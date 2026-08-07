@@ -5,6 +5,8 @@
 //! from the same config without duplicating per-provider wiring.
 
 use crate::config::{self, Config};
+#[cfg(feature = "wetype-offline")]
+use koe_asr::WeTypeOfflineProvider;
 #[cfg(feature = "apple-speech")]
 use koe_asr::{AppleSpeechConfig, AppleSpeechProvider};
 use koe_asr::{
@@ -15,8 +17,6 @@ use koe_asr::{
 use koe_asr::{MlxConfig, MlxProvider};
 #[cfg(feature = "sherpa-onnx")]
 use koe_asr::{SherpaOnnxConfig, SherpaOnnxProvider};
-#[cfg(feature = "wetype-offline")]
-use koe_asr::WeTypeOfflineProvider;
 
 /// Provider names that can be constructed in this build.
 /// Local engines (mlx, sherpa-onnx, apple-speech) only appear when their

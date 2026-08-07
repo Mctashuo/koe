@@ -1798,6 +1798,19 @@ pub fn ensure_defaults() -> Result<bool> {
             .map_err(|e| KoeError::Config(format!("create {}: {e}", dir.display())))?;
         created = true;
     }
+    // config.yaml holds API keys — keep the whole directory owner-only,
+    // tightening the mode on every launch in case it was created loosely.
+    // Best-effort on the directory itself, but never silently: the file-level
+    // 0600 below is the hard line for the secrets themselves.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)) {
+            log::warn!(
+                "could not tighten permissions on config directory {}: {e}",
+                dir.display()
+            );
+        }
+    }
 
     let defaults: &[(&std::path::Path, &str)] = &[
         (&config_file, DEFAULT_CONFIG_YAML),
@@ -1808,10 +1821,29 @@ pub fn ensure_defaults() -> Result<bool> {
 
     for (path, content) in defaults {
         if !path.exists() {
-            std::fs::write(path, content)
-                .map_err(|e| KoeError::Config(format!("write {}: {e}", path.display())))?;
+            if *path == config_file {
+                write_owner_only(path, content)
+                    .map_err(|e| KoeError::Config(format!("write {}: {e}", path.display())))?;
+            } else {
+                std::fs::write(path, content)
+                    .map_err(|e| KoeError::Config(format!("write {}: {e}", path.display())))?;
+            }
             log::info!("created default: {}", path.display());
             created = true;
+        }
+    }
+
+    // Enforce owner-only mode on a pre-existing config.yaml (contains secrets).
+    if config_file.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) =
+            std::fs::set_permissions(&config_file, std::fs::Permissions::from_mode(0o600))
+        {
+            log::warn!(
+                "could not make {} owner-only ({e}); the file may contain API keys \
+                 readable by other local users — fix its permissions manually",
+                config_file.display()
+            );
         }
     }
 
@@ -1890,10 +1922,27 @@ pub fn atomic_write_config(data: &str) -> Result<()> {
     atomic_write_file(&config_path(), data)
 }
 
+/// Write `data` to `path` with owner-only (0600) permissions, tightening the
+/// mode before any content is written even when the file already exists.
+fn write_owner_only(path: &Path, data: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(data.as_bytes())
+}
+
 /// Write data to a file atomically: write to a temp sibling, then rename.
+/// The temp file is created owner-only so secrets (API keys) never sit on
+/// disk with umask-derived permissions; the rename carries the mode over.
 fn atomic_write_file(path: &Path, data: &str) -> Result<()> {
     let tmp = path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, data)
+    write_owner_only(&tmp, data)
         .map_err(|e| KoeError::Config(format!("write {}: {e}", tmp.display())))?;
     std::fs::rename(&tmp, path).map_err(|e| {
         KoeError::Config(format!(
@@ -2221,6 +2270,24 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("koe-{name}-{nonce}.yaml"))
+    }
+
+    #[test]
+    fn atomic_write_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_config_path("perm-check");
+        // Pre-existing file with loose permissions gets tightened on rewrite.
+        fs::write(&path, "a: 1\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        atomic_write_file(&path, "a: 2\n").unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a: 2\n");
+
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

@@ -11,6 +11,11 @@ import Tokenizers
 class MLXLlmManager {
     private var container: ModelContainer?
     private var loadedModelPath: String?
+    /// Serializes loadModel / generate / unloadModel.  Two concurrent
+    /// generations on one ModelContainer (e.g. a timeout-detached generation
+    /// overlapping the next request) must never run; the Rust caller also
+    /// gates this, this lock is the last line of defense.  Never held while
+    /// calling back into Rust (this manager has no callbacks).
     private let lock = NSLock()
 
     /// Load an LLM model from a local directory (blocking).
@@ -18,7 +23,11 @@ class MLXLlmManager {
     func loadModel(path: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        return loadModelLocked(path: path)
+    }
 
+    /// Caller must hold `lock`.
+    private func loadModelLocked(path: String) -> Bool {
         if container != nil && loadedModelPath == path {
             NSLog("KoeMLX LLM: model already loaded from %@, reusing", path)
             return true
@@ -58,9 +67,15 @@ class MLXLlmManager {
         topP: Float,
         maxTokens: Int
     ) -> String? {
+        // Hold the lock for the entire generation: overlapping generations on
+        // the same container are unsafe, and unloadModel must not race an
+        // in-flight generation.
+        lock.lock()
+        defer { lock.unlock() }
+
         // Ensure model is loaded (lazy load / switch)
         if container == nil || loadedModelPath != modelPath {
-            if !loadModel(path: modelPath) {
+            if !loadModelLocked(path: modelPath) {
                 return nil
             }
         }

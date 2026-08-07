@@ -29,6 +29,7 @@ bytes = "1"
 sherpa-onnx = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+url.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 ndarray = { version = "0.16", optional = true }
 rustfft = { version = "6", optional = true }

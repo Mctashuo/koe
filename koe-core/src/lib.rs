@@ -161,8 +161,25 @@ pub unsafe extern "C" fn sp_core_create(config_path: *const c_char) -> i32 {
 #[no_mangle]
 pub extern "C" fn sp_core_destroy() {
     log::info!("sp_core_destroy called");
-    let mut global = CORE.lock().unwrap();
-    *global = None;
+    // Take the core out of the global first so the lock is not held while the
+    // runtime shuts down (callbacks / other FFI entry points take this lock).
+    let core = CORE.lock().unwrap().take();
+    if let Some(mut core) = core {
+        // Abort any active session: signal its cancelled flag and close its
+        // channels so a still-polled task exits via its normal close() path.
+        core.cancelled.store(true, Ordering::SeqCst);
+        core.audio_tx = None;
+        core.accept_asr_tx = None;
+
+        let Core { runtime, .. } = core;
+        // Bounded synchronous shutdown instead of an abrupt Drop: worker
+        // threads drop in-flight tasks (each ASR provider's Drop cancels its
+        // Swift session before freeing the callback context) and blocking
+        // tasks (e.g. MLX LLM generation) get a chance to finish, all before
+        // this returns and the process proceeds to tear down.
+        runtime.shutdown_timeout(Duration::from_secs(2));
+        log::info!("core runtime shut down");
+    }
 }
 
 /// Register callbacks from the Obj-C side.

@@ -23,7 +23,19 @@ class MLXAsrManager {
     private var eventTask: Task<Void, Never>?
     private var callback: MLXEventCallback?
     private var callbackCtx: UnsafeMutableRawPointer?
+    /// Leaf lock guarding `callback`, `callbackCtx`, and `generation`.
+    /// Held across callback invocation so that once cancel() has cleared the
+    /// context under this lock, no invocation with the old context can be in
+    /// flight after cancel() returns — Rust relies on this before freeing the
+    /// context.  Safe to hold during the call: the Rust trampoline only does a
+    /// non-blocking channel send and never re-enters Swift.
     private let callbackLock = NSLock()
+    /// Serializes entire lifecycle operations (load/start/feed/stop/cancel/
+    /// unload) so a stale cancel cannot interleave with a concurrent start on
+    /// this singleton.  Lock ordering: stateLock MAY be taken before
+    /// callbackLock, NEVER the reverse.  Never held while calling back into
+    /// Rust (invokeCallback only takes callbackLock).
+    private let stateLock = NSLock()
     /// Monotonically increasing generation counter.  Each startSession bumps it;
     /// feedAudio / stop / cancel only act when the caller's generation matches.
     private var generation: UInt64 = 0
@@ -31,6 +43,8 @@ class MLXAsrManager {
     /// Load a Qwen3-ASR model from a local directory (blocking).
     /// Skips loading if the same path is already loaded.
     func loadModel(path: String) -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         if model != nil && loadedModelPath == path {
             NSLog("KoeMLX: model already loaded from %@, reusing", path)
             return true
@@ -60,21 +74,22 @@ class MLXAsrManager {
                       delayPreset: String,
                       callback: MLXEventCallback,
                       context: UnsafeMutableRawPointer?) -> UInt64 {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+
         guard let model = self.model else {
             NSLog("KoeMLX: model not loaded")
             return 0
         }
 
         // Cancel any in-flight session before overwriting singleton state
-        session?.cancel()
-        eventTask?.cancel()
-        eventTask = nil
-        session = nil
+        cancelLocked()
 
+        // Bump generation and install callback atomically so that
+        // invokeCallback's generation check is consistent.
+        callbackLock.lock()
         generation &+= 1
         let thisGeneration = generation
-
-        callbackLock.lock()
         self.callback = callback
         self.callbackCtx = context
         callbackLock.unlock()
@@ -104,7 +119,7 @@ class MLXAsrManager {
 
         eventTask = Task { [weak self] in
             for await event in session.events {
-                guard let self = self, self.generation == thisGeneration else { break }
+                guard let self = self, self.isCurrent(thisGeneration) else { break }
                 switch event {
                 case .displayUpdate(let confirmed, let provisional):
                     self.invokeCallback(eventType: 0, text: confirmed + provisional, generation: thisGeneration)
@@ -118,7 +133,7 @@ class MLXAsrManager {
                     break
                 }
             }
-            if let self = self, self.generation == thisGeneration {
+            if let self = self, self.isCurrent(thisGeneration) {
                 self.invokeCallback(eventType: 5, text: "", generation: thisGeneration)
             }
         }
@@ -129,6 +144,8 @@ class MLXAsrManager {
     /// Feed raw f32 PCM samples at 16kHz.
     /// Ignored if `gen` doesn't match the current session generation.
     func feedAudio(_ samples: UnsafePointer<Float>, count: Int, generation gen: UInt64) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         guard gen == generation else { return }
         let buffer = Array(UnsafeBufferPointer(start: samples, count: count))
         session?.feedAudio(samples: buffer)
@@ -137,18 +154,40 @@ class MLXAsrManager {
     /// Gracefully stop the session (flush remaining audio, emit .ended).
     /// Ignored if `gen` doesn't match the current session generation.
     func stop(generation gen: UInt64) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         guard gen == generation else { return }
         session?.stop()
     }
 
     /// Cancel the session immediately.
     /// Ignored if `gen` doesn't match the current session generation.
+    ///
+    /// Guarantee: after this returns, no further callback invocations with
+    /// this generation's context can occur (see `callbackLock`).
     func cancel(generation gen: UInt64) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
         guard gen == generation else { return }
+        cancelLocked()
+    }
 
-        // Clear callback context under lock FIRST so any in-flight or
+    /// Unload the model to free memory.
+    func unloadModel() {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        cancelLocked()
+        model = nil
+        loadedModelPath = nil
+    }
+
+    // MARK: - Private
+
+    /// Tear down the current session. Caller must hold `stateLock`.
+    private func cancelLocked() {
+        // Clear callback context under callbackLock FIRST so any in-flight or
         // subsequent invokeCallback sees nil and never touches the pointer.
-        // Rust's close() reclaims the pointer only after this returns.
+        // Rust's close()/drop reclaims the pointer only after this returns.
         callbackLock.lock()
         callback = nil
         callbackCtx = nil
@@ -160,14 +199,12 @@ class MLXAsrManager {
         session = nil
     }
 
-    /// Unload the model to free memory.
-    func unloadModel() {
-        cancel(generation: generation)
-        model = nil
-        loadedModelPath = nil
+    /// Read the current generation under the callback lock (for async tasks).
+    private func isCurrent(_ gen: UInt64) -> Bool {
+        callbackLock.lock()
+        defer { callbackLock.unlock() }
+        return generation == gen
     }
-
-    // MARK: - Private
 
     private func invokeCallback(eventType: Int32, text: String, generation gen: UInt64) {
         callbackLock.lock()

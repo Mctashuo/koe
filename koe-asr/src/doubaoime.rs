@@ -274,18 +274,75 @@ fn rand_bytes<const N: usize>() -> [u8; N] {
 }
 
 fn load_credentials(path: &Path) -> Option<DeviceCredentials> {
+    // The cached token is a secret. Files written by older releases (or
+    // tampered with externally) may carry loose permissions, and a token
+    // younger than the refresh interval is used as-is without ever passing
+    // through save_credentials — so enforce owner-only mode before trusting
+    // the cache. If the mode cannot be tightened, refuse the cached file and
+    // let the caller fetch fresh credentials (which rewrites it as 0600).
+    match enforce_owner_only(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            log::warn!(
+                "[DoubaoIME] cached credentials at {} could not be made owner-only ({e}); \
+                 ignoring cached file and fetching fresh credentials",
+                path.display()
+            );
+            return None;
+        }
+    }
     let data = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
 }
 
+/// Ensure the credential file is a regular file with owner-only (0600)
+/// permissions, chmodding it if the current mode is looser.
+fn enforce_owner_only(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.file_type().is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    if meta.permissions().mode() & 0o077 != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 fn save_credentials(path: &Path, creds: &DeviceCredentials) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| AsrError::Connection(format!("create credential dir: {e}")))?;
+        if !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AsrError::Connection(format!("create credential dir: {e}")))?;
+            // Best effort on the directory; the credential file itself is
+            // opened 0600 below, which is the hard line for the secret.
+            if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            {
+                log::warn!(
+                    "[DoubaoIME] could not tighten permissions on credential dir {}: {e}",
+                    parent.display()
+                );
+            }
+        }
     }
     let json = serde_json::to_string_pretty(creds)
         .map_err(|e| AsrError::Connection(format!("serialize credentials: {e}")))?;
-    std::fs::write(path, json)
+    // The token is a secret — keep the file owner-only, tightening the mode
+    // even when the file already exists with looser permissions.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| AsrError::Connection(format!("open credentials file: {e}")))?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| AsrError::Connection(format!("set credentials permissions: {e}")))?;
+    file.write_all(json.as_bytes())
         .map_err(|e| AsrError::Connection(format!("write credentials: {e}")))?;
     Ok(())
 }
@@ -513,7 +570,13 @@ async fn get_asr_token(http: &reqwest::Client, device_id: &str, cdid: &str) -> R
 }
 
 async fn ensure_credentials(credential_path: &Path) -> Result<DeviceCredentials> {
-    let http = reqwest::Client::new();
+    // Device registration and token refresh carry credentials, so a redirect
+    // off the hardcoded https origin (or down to plain http) must fail rather
+    // than forward them. Same policy as the user-configurable endpoints.
+    let http = reqwest::Client::builder()
+        .redirect(crate::endpoint::validating_redirect_policy())
+        .build()
+        .map_err(|e| AsrError::Connection(format!("http client: {e}")))?;
     let mut creds = if let Some(creds) = load_credentials(credential_path) {
         if !creds.device_id.is_empty() {
             creds
@@ -1119,7 +1182,8 @@ impl AsrProvider for DoubaoImeProvider {
 
                 // Non-streaming (third-pass) or definite (second-pass) result
                 if nonstream_result || (!is_interim && is_vad_finished) {
-                    log::info!("[DoubaoIME] Final: {full}");
+                    log::info!("[DoubaoIME] Final: {} chars", full.chars().count());
+                    log::debug!("[DoubaoIME] Final text: {full}");
                     // Do NOT bake `full` into confirmed_text here (tried in
                     // v1.0.22, reverted): the server's results array often
                     // still carries the earlier confirmed segments, so `text`

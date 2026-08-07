@@ -313,7 +313,10 @@ impl<'a> PackReader<'a> {
 
 /// One parsed tensor: either raw fp32 (dtype 0) or int8+scale (dtype 2).
 enum Raw {
-    F32 { dims: Vec<usize>, data: Vec<f32> },
+    F32 {
+        dims: Vec<usize>,
+        data: Vec<f32>,
+    },
     /// Raw int8 (NOT dequantized) + scale, shape (out, in) as stored.
     I8 {
         out: usize,

@@ -3,6 +3,7 @@ use crate::config::{
 };
 use crate::errors::{KoeError, Result};
 use crate::llm::{CorrectionRequest, LlmProvider};
+use koe_asr::endpoint::validate_endpoint_url;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -38,6 +39,7 @@ impl OpenAiCompatibleProvider {
     }
 
     pub async fn warmup(&self) -> Result<()> {
+        validate_endpoint_url(&self.profile.base_url).map_err(KoeError::LlmFailed)?;
         let model = encode(&self.profile.model);
         let url = format!(
             "{}/models/{}",
@@ -154,6 +156,7 @@ pub async fn list_models_for_profile(
     client: Client,
     profile: &LlmProfileRuntimeConfig,
 ) -> Result<Vec<String>> {
+    validate_endpoint_url(&profile.base_url).map_err(KoeError::LlmFailed)?;
     let mut url = build_models_url(&profile.base_url);
     if profile.effective_api_protocol() == LlmApiProtocol::AnthropicMessages {
         url.push_str("?limit=1000");
@@ -184,6 +187,10 @@ pub async fn list_models_for_profile(
 
 pub fn build_http_client(timeout_ms: u64) -> std::result::Result<Client, reqwest::Error> {
     Client::builder()
+        // The base URL is user-configurable; re-validate every redirect hop so
+        // an allowed endpoint cannot bounce the request (and its Authorization
+        // header) to plaintext http or a disallowed host.
+        .redirect(koe_asr::endpoint::validating_redirect_policy())
         .timeout(Duration::from_millis(timeout_ms))
         .pool_idle_timeout(LLM_HTTP_POOL_IDLE_TIMEOUT)
         .pool_max_idle_per_host(2)
@@ -496,6 +503,7 @@ fn parse_protocol_response(protocol: LlmApiProtocol, json: &Value) -> Result<Str
 #[async_trait::async_trait]
 impl LlmProvider for OpenAiCompatibleProvider {
     async fn correct(&self, request: &CorrectionRequest) -> Result<String> {
+        validate_endpoint_url(&self.profile.base_url).map_err(KoeError::LlmFailed)?;
         let protocol = self.profile.effective_api_protocol();
         let url = build_endpoint_url(
             &self.profile.base_url,

@@ -4,6 +4,35 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 
+// Everything one tap thread owns, handed to it at creation. The thread never
+// reads the monitor's shared tap properties: after a teardown that timed out,
+// those may already belong to a replacement thread, and a late worker reading
+// them could disable the new tap or signal the wrong semaphore. The monitor
+// publishes the live context under @synchronized(self) and only ever clears
+// state belonging to the context it still considers current.
+@class SPHotkeyMonitor;
+
+@interface SPTapContext : NSObject
+// The monitor this generation belongs to. Weak: the context outlives a
+// timed-out teardown, and a late callback must not resurrect the monitor.
+@property (nonatomic, weak) SPHotkeyMonitor *monitor;
+@property (nonatomic, strong) dispatch_semaphore_t ready;
+@property (nonatomic, strong) dispatch_semaphore_t shutdown;
+// Set by stopTapThread. A thread that is still starting up checks this
+// before installing its tap, so a stop that raced the launch cannot leave a
+// live tap behind.
+@property (atomic, assign) BOOL stopRequested;
+@property (atomic, assign) CFRunLoopRef runLoop;
+// The tap this thread created, published so a stop can disable it promptly.
+// Only ever released by the owning thread.
+@property (atomic, assign) CFMachPortRef tap;
+
+/// The monitor, but only while this context is still its live generation and
+/// no stop has been requested. nil otherwise, so callbacks from a superseded
+/// tap become no-ops.
+- (SPHotkeyMonitor *)currentMonitor;
+@end
+
 typedef NS_ENUM(NSInteger, SPHotkeyState) {
     SPHotkeyStateIdle,
     SPHotkeyStatePending,        // Trigger key pressed, waiting to determine tap vs hold
@@ -39,8 +68,10 @@ typedef NS_ENUM(NSInteger, SPHotkeyState) {
 // on tap behavior here; the actual culprit was SPPermissionManager leaking
 // its permission-probe taps — see isInputMonitoringGranted.)
 @property (nonatomic, strong) NSThread *tapThread;
-@property (nonatomic, assign) CFRunLoopRef tapRunLoop;
-@property (nonatomic, strong) dispatch_semaphore_t tapShutdownSemaphore;
+// The context of the tap thread the monitor currently considers live. Read
+// and written under @synchronized(self); a worker compares its own context
+// against this before touching any shared state.
+@property (nonatomic, strong) SPTapContext *tapContext;
 // Whether the tap can consume events (an ACTIVE/filtering tap was created).
 // Internal only — callers consult canConsumeHandlerKeyEvents, which also
 // covers the Carbon capture used for modifier-only triggers.
@@ -75,7 +106,7 @@ typedef NS_ENUM(NSInteger, SPHotkeyState) {
 - (BOOL)isSuppressedHotkeyKeyCode:(NSNumber *)keyCodeNumber;
 - (void)addSuppressedHotkeyKeyCode:(NSNumber *)keyCodeNumber;
 - (BOOL)removeSuppressedHotkeyKeyCodeIfPresent:(NSNumber *)keyCodeNumber;
-- (void)tapThreadMain:(dispatch_semaphore_t)readySemaphore;
+- (void)tapThreadMain:(SPTapContext *)context;
 - (BOOL)needsEventConsumption;
 - (void)startTapThread;
 - (void)stopTapThread;
@@ -90,6 +121,22 @@ typedef NS_ENUM(NSInteger, SPHotkeyState) {
 - (void)cancelDoubleTapCandidateForInterveningInput;
 - (void)handleTriggerDown;
 - (void)handleTriggerUp;
+
+@end
+
+@implementation SPTapContext
+
+- (SPHotkeyMonitor *)currentMonitor {
+    if (self.stopRequested) return nil;
+    SPHotkeyMonitor *monitor = self.monitor;
+    if (!monitor) return nil;
+    @synchronized (monitor) {
+        // `tapContext` is the monitor's live generation; anything else is a
+        // tap whose teardown has already been ordered.
+        if (monitor.tapContext != self) return nil;
+    }
+    return monitor;
+}
 
 @end
 
@@ -111,6 +158,7 @@ static NSInteger numberForKeyCode(NSInteger keyCode) {
 static BOOL isReturnKeyCode(NSInteger keyCode) {
     return keyCode == 36 || keyCode == 76; // Return or keypad Enter
 }
+
 
 // ANSI key codes for digits 1-9, indexed by the digit itself (index 0 unused).
 static const UInt32 SPDigitKeyCodeForNumber[10] = {0, 18, 19, 20, 21, 23, 22, 26, 28, 25};
@@ -166,7 +214,13 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
                                        CGEventType type,
                                        CGEventRef event,
                                        void *userInfo) {
-    SPHotkeyMonitor *monitor = (__bridge SPHotkeyMonitor *)userInfo;
+    // userInfo is the generation's context, not the monitor: after a
+    // teardown that timed out, this callback can still fire for a tap the
+    // monitor no longer considers live, and acting on it would drive the
+    // state machine from a stale generation.
+    SPTapContext *context = (__bridge SPTapContext *)userInfo;
+    SPHotkeyMonitor *monitor = [context currentMonitor];
+    if (!monitor) return event;
 
     if (type == kCGEventTapDisabledByTimeout || type == kCGEventTapDisabledByUserInput) {
         // Only re-enable the tap if we are still running.  During teardown
@@ -353,18 +407,23 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
 
 - (void)startTapThread {
     if (self.tapThread) return;
-    dispatch_semaphore_t ready = dispatch_semaphore_create(0);
-    self.tapShutdownSemaphore = dispatch_semaphore_create(0);
+    SPTapContext *context = [[SPTapContext alloc] init];
+    context.monitor = self;
+    context.ready = dispatch_semaphore_create(0);
+    context.shutdown = dispatch_semaphore_create(0);
+    @synchronized (self) {
+        self.tapContext = context;
+    }
     NSThread *thread = [[NSThread alloc] initWithTarget:self
                                                selector:@selector(tapThreadMain:)
-                                                 object:ready];
+                                                 object:context];
     thread.name = @"im.koe.hotkey-tap";
     thread.qualityOfService = NSQualityOfServiceUserInteractive;
     self.tapThread = thread;
     [thread start];
     // Wait for the tap to be installed so canConsumeGlobalKeyEvents is
     // accurate for callers that read it right after this returns.
-    dispatch_semaphore_wait(ready, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)));
+    dispatch_semaphore_wait(context.ready, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)));
 
     if (!self.eventTap) {
         NSLog(@"[Koe] CGEventTap unavailable (ok, NSEvent monitors active)");
@@ -373,22 +432,37 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
 
 - (void)stopTapThread {
     if (!self.tapThread) return;
-    // Disable first so the tap stops gating the session event stream
-    // immediately, then stop the tap thread's run loop and wait for it to
-    // finish tearing the tap down on its own thread.
-    if (self.eventTap) {
-        CGEventTapEnable(self.eventTap, false);
+    SPTapContext *context;
+    @synchronized (self) {
+        context = self.tapContext;
+        // Unpublish first: from here on the worker owns its teardown alone
+        // and can no longer touch the monitor's shared tap state, so a
+        // replacement thread started right after this is safe from it.
+        self.tapContext = nil;
+        self.eventTap = NULL;
+        self.runLoopSource = NULL;
     }
-    CFRunLoopRef tapRunLoop = self.tapRunLoop;
+    // Tell a thread that has not finished starting up not to install a tap,
+    // and disable one that already exists so it stops gating the session
+    // event stream immediately.
+    context.stopRequested = YES;
+    CFMachPortRef tap = context.tap;
+    if (tap) {
+        CGEventTapEnable(tap, false);
+    }
+    CFRunLoopRef tapRunLoop = context.runLoop;
     if (tapRunLoop) {
         CFRunLoopStop(tapRunLoop);
     }
-    if (self.tapShutdownSemaphore) {
-        dispatch_semaphore_wait(self.tapShutdownSemaphore,
-                                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)));
+    if (context.shutdown &&
+        dispatch_semaphore_wait(context.shutdown,
+                                dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC))) != 0) {
+        // The worker did not exit in time. Everything it still has to tear
+        // down belongs to its own context, so a replacement thread cannot be
+        // clobbered by its late cleanup.
+        NSLog(@"[Koe] Tap thread teardown timed out; late cleanup is context-owned");
     }
     self.tapThread = nil;
-    self.tapShutdownSemaphore = nil;
     self.canConsumeGlobalKeyEvents = NO;
 }
 
@@ -502,8 +576,15 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
     return self.canConsumeGlobalKeyEvents;
 }
 
-- (void)tapThreadMain:(dispatch_semaphore_t)readySemaphore {
+- (void)tapThreadMain:(SPTapContext *)context {
     @autoreleasepool {
+        // Everything this thread owns lives in `context` and in locals. The
+        // monitor's shared properties are published for the callback and for
+        // a prompt disable, but are never read back here: after a timed-out
+        // stop they may already belong to a replacement thread, and touching
+        // them would let this worker disable or release the NEW tap.
+        CFMachPortRef ownTap = NULL;
+        CFRunLoopSourceRef ownSource = NULL;
         // When consumption is needed, prefer active taps that can swallow
         // handled events so they do not leak into the user's focused app;
         // some systems reject one tap location but allow another, so try
@@ -531,49 +612,83 @@ static CGEventRef hotkeyEventCallback(CGEventTapProxy proxy,
             ? sizeof(activeAttempts) / sizeof(activeAttempts[0])
             : sizeof(listenAttempts) / sizeof(listenAttempts[0]);
 
-        self.canConsumeGlobalKeyEvents = NO;
+        context.runLoop = CFRunLoopGetCurrent();
+        BOOL consumes = NO;
         for (NSUInteger i = 0; i < attemptCount; i++) {
-            self.eventTap = CGEventTapCreate(attempts[i].location,
-                                             kCGHeadInsertEventTap,
-                                             attempts[i].options,
-                                             mask,
-                                             hotkeyEventCallback,
-                                             (__bridge void *)self);
-            if (!self.eventTap) {
+            // A stop that raced this launch must not leave a live tap behind.
+            if (context.stopRequested) break;
+
+            ownTap = CGEventTapCreate(attempts[i].location,
+                                      kCGHeadInsertEventTap,
+                                      attempts[i].options,
+                                      mask,
+                                      hotkeyEventCallback,
+                                      (__bridge void *)context);
+            if (!ownTap) {
                 continue;
             }
 
-            self.runLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, self.eventTap, 0);
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), self.runLoopSource, kCFRunLoopCommonModes);
-            CGEventTapEnable(self.eventTap, true);
-            self.canConsumeGlobalKeyEvents = (attempts[i].options == kCGEventTapOptionDefault);
+            ownSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, ownTap, 0);
+            if (!ownSource) {
+                NSLog(@"[Koe] CFMachPortCreateRunLoopSource failed; trying next tap location");
+                CFRelease(ownTap);
+                ownTap = NULL;
+                continue;
+            }
+            CFRunLoopAddSource(CFRunLoopGetCurrent(), ownSource, kCFRunLoopCommonModes);
+            CGEventTapEnable(ownTap, true);
+            context.tap = ownTap;
+            consumes = (attempts[i].options == kCGEventTapOptionDefault);
             NSLog(@"%@", attempts[i].logMessage);
             break;
         }
 
-        self.tapRunLoop = CFRunLoopGetCurrent();
-        dispatch_semaphore_signal(readySemaphore);
+        // Publish for the callback and for a prompt disable, but only while
+        // this thread is still the live one — and re-check stopRequested
+        // under the lock so a stop that ran between the loop and here does
+        // not leave a live tap published.
+        BOOL abandoned = NO;
+        @synchronized (self) {
+            if (self.tapContext == context && !context.stopRequested) {
+                self.eventTap = ownTap;
+                self.runLoopSource = ownSource;
+                self.canConsumeGlobalKeyEvents = consumes;
+            } else {
+                abandoned = YES;
+            }
+        }
+        dispatch_semaphore_signal(context.ready);
 
-        if (self.runLoopSource) {
+        if (ownSource && !abandoned) {
             CFRunLoopRun(); // exits via CFRunLoopStop from -stop
         }
 
         // Tear the tap down on the thread that owns it, so the callback can
-        // never race the release.
-        if (self.eventTap) {
-            CGEventTapEnable(self.eventTap, false);
+        // never race the release. The shared properties are unpublished under
+        // the lock, and only while this thread is still the live one — after
+        // a timed-out stop they belong to a replacement thread.
+        @synchronized (self) {
+            if (self.tapContext == context) {
+                self.eventTap = NULL;
+                self.runLoopSource = NULL;
+                self.canConsumeGlobalKeyEvents = NO;
+            }
         }
-        if (self.runLoopSource) {
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), self.runLoopSource, kCFRunLoopCommonModes);
-            CFRelease(self.runLoopSource);
-            self.runLoopSource = NULL;
+        if (ownTap) {
+            CGEventTapEnable(ownTap, false);
         }
-        if (self.eventTap) {
-            CFRelease(self.eventTap);
-            self.eventTap = NULL;
+        if (ownSource) {
+            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), ownSource, kCFRunLoopCommonModes);
+            CFRelease(ownSource);
         }
-        self.tapRunLoop = NULL;
-        dispatch_semaphore_signal(self.tapShutdownSemaphore);
+        if (ownTap) {
+            context.tap = NULL;
+            CFRelease(ownTap);
+        }
+        context.runLoop = NULL;
+        if (context.shutdown) {
+            dispatch_semaphore_signal(context.shutdown);
+        }
     }
 }
 

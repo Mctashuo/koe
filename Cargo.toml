@@ -45,6 +45,9 @@ md-5 = "0.10"
 rustls = { version = "0.23", default-features = false }
 sherpa-onnx = "1.12"
 tokio-tungstenite = "0.24"
+# Same parser reqwest uses internally; endpoint validation must judge the
+# URL exactly as it will be fetched.
+url = "2.5"
 
 # koe-core
 cbindgen = "0.27"

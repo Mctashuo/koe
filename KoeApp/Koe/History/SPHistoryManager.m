@@ -1,5 +1,8 @@
 #import "SPHistoryManager.h"
 #import <sqlite3.h>
+#import <sys/stat.h>
+#import <errno.h>
+#import <string.h>
 
 @implementation SPHistoryStats
 @end
@@ -34,15 +37,28 @@
 }
 
 - (void)openDatabaseAtPath:(NSString *)dbPath {
+    // The database stores everything the user has dictated — owner-only
+    // permissions on the directory and file (matches the config hardening).
     [[NSFileManager defaultManager] createDirectoryAtPath:dbPath.stringByDeletingLastPathComponent
                               withIntermediateDirectories:YES
-                                               attributes:nil
+                                               attributes:@{NSFilePosixPermissions : @(0700)}
                                                     error:nil];
 
     if (sqlite3_open(dbPath.UTF8String, &_db) != SQLITE_OK) {
+        // sqlite3_open returns a handle even on failure; it must be closed
+        // or it (and its resources) leak until process exit.
         NSLog(@"[Koe] Failed to open history database: %s", sqlite3_errmsg(_db));
+        if (_db) {
+            sqlite3_close_v2(_db);
+        }
         _db = NULL;
         return;
+    }
+    // The database holds every transcript; a failure to make it owner-only
+    // is worth surfacing rather than silently continuing world-readable.
+    if (chmod(dbPath.UTF8String, 0600) != 0) {
+        NSLog(@"[Koe] WARNING: could not restrict history database permissions (%s): %s",
+              dbPath.UTF8String, strerror(errno));
     }
 
     const char *sql =

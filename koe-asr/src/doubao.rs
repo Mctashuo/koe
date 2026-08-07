@@ -355,6 +355,8 @@ impl AsrProvider for DoubaoWsProvider {
     async fn connect(&mut self, config: &AsrConfig) -> Result<()> {
         let connect_timeout = Duration::from_millis(config.connect_timeout_ms);
 
+        crate::endpoint::validate_endpoint_url(&config.url).map_err(AsrError::Connection)?;
+
         log::info!(
             "connecting to ASR: {} (connect_id={})",
             config.url,

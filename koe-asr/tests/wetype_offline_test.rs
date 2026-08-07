@@ -118,7 +118,10 @@ async fn streaming_emits_interim() {
             println!("interim: {t:?}");
         }
     }
-    assert!(interims >= 1, "expected at least one Interim during streaming");
+    assert!(
+        interims >= 1,
+        "expected at least one Interim during streaming"
+    );
 
     asr.finish_input().await.unwrap();
     let mut final_text = String::new();

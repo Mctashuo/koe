@@ -178,6 +178,7 @@ impl AsrProvider for GlmAsrProvider {
         } else {
             config.url.clone()
         };
+        crate::endpoint::validate_endpoint_url(&self.url).map_err(AsrError::Connection)?;
 
         self.model = if config.app_key.is_empty() {
             DEFAULT_MODEL.to_string()
@@ -189,6 +190,9 @@ impl AsrProvider for GlmAsrProvider {
 
         self.client = Some(
             Client::builder()
+                // Endpoint is user-configurable: re-validate every redirect hop
+                // so it cannot bounce to plaintext http or a disallowed host.
+                .redirect(crate::endpoint::validating_redirect_policy())
                 .timeout(std::time::Duration::from_secs(120))
                 .build()
                 .map_err(|e| AsrError::Connection(format!("failed to create HTTP client: {e}")))?,
@@ -356,7 +360,8 @@ impl AsrProvider for GlmAsrProvider {
                         if data == "[DONE]" {
                             if !self.last_text.is_empty() {
                                 let final_text = std::mem::take(&mut self.last_text);
-                                log::info!("[GLM ASR] Final: {}", final_text);
+                                log::info!("[GLM ASR] Final: {} chars", final_text.chars().count());
+                                log::debug!("[GLM ASR] Final text: {}", final_text);
                                 return Ok(AsrEvent::Final(final_text));
                             }
                             return Ok(AsrEvent::Closed(None));
@@ -387,7 +392,8 @@ impl AsrProvider for GlmAsrProvider {
                     // Stream ended
                     if !self.last_text.is_empty() {
                         let final_text = std::mem::take(&mut self.last_text);
-                        log::info!("[GLM ASR] Final: {}", final_text);
+                        log::info!("[GLM ASR] Final: {} chars", final_text.chars().count());
+                        log::debug!("[GLM ASR] Final text: {}", final_text);
                         return Ok(AsrEvent::Final(final_text));
                     }
                     return Ok(AsrEvent::Closed(None));

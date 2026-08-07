@@ -109,6 +109,29 @@ impl AppleSpeechProvider {
         }
     }
 
+    /// Cancel the Swift session (if any) and reclaim the callback context.
+    ///
+    /// Idempotent: called from both `close()` and `Drop` — the generation is
+    /// zeroed after the cancel and the context pointer is `Option::take`n, so
+    /// a second call is a no-op.
+    ///
+    /// SAFETY: `koe_apple_speech_cancel()` synchronously clears the callback
+    /// context on the Swift side under the callback lock, and callback
+    /// invocation holds that same lock, so once it returns no further calls
+    /// through the callback pointer can occur.  Only then is it safe to free
+    /// the boxed sender.  The generation parameter makes a stale cancel a
+    /// no-op if a new session has already started on the Swift singleton.
+    fn shutdown_session(&mut self) {
+        if self.session_generation != 0 {
+            unsafe {
+                koe_apple_speech_cancel(self.session_generation);
+            }
+            self.session_generation = 0;
+        }
+        self.event_rx = None;
+        self.reclaim_sender();
+    }
+
     /// Serialize contextual strings as a null-separated byte blob for FFI.
     fn serialize_contextual_strings(strings: &[String]) -> Vec<u8> {
         let mut blob = Vec::new();
@@ -203,22 +226,17 @@ impl crate::provider::AsrProvider for AppleSpeechProvider {
     }
 
     async fn close(&mut self) -> Result<()> {
-        // SAFETY: koe_apple_speech_cancel() synchronously clears the callback
-        // context on the Swift side (under a lock), ensuring no further calls
-        // through the callback pointer after this returns.
-        // The generation parameter ensures that if a new session has already
-        // started on the singleton, this stale cancel is a no-op.
-        unsafe {
-            koe_apple_speech_cancel(self.session_generation);
-        }
-        self.event_rx = None;
-        self.reclaim_sender();
+        self.shutdown_session();
         Ok(())
     }
 }
 
 impl Drop for AppleSpeechProvider {
     fn drop(&mut self) {
-        self.reclaim_sender();
+        // Must cancel the Swift session before freeing the callback context:
+        // if the provider is dropped without close() (e.g. the session task is
+        // aborted at runtime shutdown), Swift still holds the raw context
+        // pointer and its async tasks would otherwise call into freed memory.
+        self.shutdown_session();
     }
 }

@@ -145,7 +145,8 @@ impl QwenAsrProvider {
                     .unwrap_or("");
 
                 if !transcript.is_empty() {
-                    log::info!("[Qwen ASR] Final: {}", transcript);
+                    log::info!("[Qwen ASR] Final: {} chars", transcript.chars().count());
+                    log::debug!("[Qwen ASR] Final text: {}", transcript);
                     events.push(AsrEvent::Definite(transcript.to_string()));
                     events.push(AsrEvent::Final(transcript.to_string()));
                 }
@@ -217,6 +218,8 @@ impl AsrProvider for QwenAsrProvider {
         if api_key.is_empty() {
             return Err(AsrError::Connection("api_key is required".into()));
         }
+
+        crate::endpoint::validate_endpoint_url(&config.url).map_err(AsrError::Connection)?;
 
         let ws_url = format!("{}?model={}", config.url, config.app_key);
         log::info!("Connecting to Qwen ASR: {}", ws_url);

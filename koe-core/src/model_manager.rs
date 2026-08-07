@@ -15,6 +15,14 @@ use crate::errors::{KoeError, Result};
 const MANIFEST_FILE: &str = ".koe-manifest.json";
 const CHECKSUM_CACHE_FILE: &str = ".koe-checksum.json";
 
+/// Hard per-file download cap applied when the manifest declares no size
+/// (`size == 0`, e.g. upstream size metadata was missing). The largest model
+/// file Koe ships today is ~135 MB, so 8 GiB leaves ample headroom for far
+/// larger future models while still bounding a malicious or broken server to
+/// a finite disk write instead of an unbounded stream. Manifests that declare
+/// a size keep the stricter exact-size check.
+const MAX_UNSIZED_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
 // ─── Data Structures ────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -76,16 +84,82 @@ struct ChecksumEntry {
     sha256: String,
 }
 
+/// Read the checksum cache, refusing to follow a non-regular path.
+///
+/// A symlink planted at `.koe-checksum.json` would otherwise be dereferenced,
+/// and pointing it at a character device (`/dev/zero`) turns this into an
+/// unbounded read. Absent/unreadable/corrupt caches degrade to "no cache",
+/// exactly as before.
 fn load_checksum_cache(path: &Path) -> Option<HashMap<String, ChecksumEntry>> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        log::warn!(
+            "ignoring checksum cache {}: not a regular file",
+            path.display()
+        );
+        return None;
+    }
     let content = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&content).ok()
 }
 
+/// Write the checksum cache without ever following a symlink and without
+/// truncating in place.
+///
+/// `std::fs::write` opens with `O_TRUNC` and follows symlinks, so a link
+/// planted at `.koe-checksum.json` (the model dir is writable by anything that
+/// can drop files there) would let verification destroy an arbitrary file.
+/// Instead: refuse when the existing path is not a regular file, then write to
+/// a fresh temp file in the same directory and rename over the destination —
+/// `rename` replaces the entry itself rather than writing through it, and the
+/// swap is atomic so a crash never leaves a half-written cache.
 fn write_checksum_cache(path: &Path, cache: &HashMap<String, ChecksumEntry>) -> Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_file() {
+            return Err(KoeError::Config(format!(
+                "refusing to write checksum cache {}: not a regular file",
+                path.display()
+            )));
+        }
+    }
+
     let json = serde_json::to_string_pretty(cache)
         .map_err(|e| KoeError::Config(format!("serialize checksum cache: {e}")))?;
-    std::fs::write(path, json)
-        .map_err(|e| KoeError::Config(format!("write checksum cache: {e}")))?;
+
+    let dir = path.parent().ok_or_else(|| {
+        KoeError::Config(format!(
+            "checksum cache path {} has no parent directory",
+            path.display()
+        ))
+    })?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        "{CHECKSUM_CACHE_FILE}.tmp.{}.{unique}",
+        std::process::id()
+    ));
+
+    // `create_new` so a path planted at the temp name is never followed.
+    let write_tmp = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.flush()
+    };
+    if let Err(e) = write_tmp() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(KoeError::Config(format!("write checksum cache: {e}")));
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(KoeError::Config(format!("write checksum cache: {e}")));
+    }
     Ok(())
 }
 
@@ -148,12 +222,13 @@ fn scan_dir_recursive(dir: &Path, models: &mut Vec<DiscoveredModel>) {
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            let manifest_path = path.join(MANIFEST_FILE);
-            if manifest_path.exists() {
-                if let Some(model) = load_manifest(&path) {
-                    models.push(model);
-                }
+        // `Path::is_dir` follows symlinks: a link planted under the models
+        // root would make discovery recurse outside it, or loop forever on a
+        // cycle. Use the entry's own type so links are simply skipped.
+        let is_real_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        if is_real_dir {
+            if let Some(model) = load_manifest(&path) {
+                models.push(model);
             }
             // Continue scanning subdirectories
             scan_dir_recursive(&path, models);
@@ -161,9 +236,31 @@ fn scan_dir_recursive(dir: &Path, models: &mut Vec<DiscoveredModel>) {
     }
 }
 
+/// A manifest is small JSON; anything larger is malformed or hostile.
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
 fn load_manifest(model_dir: &Path) -> Option<DiscoveredModel> {
     let manifest_path = model_dir.join(MANIFEST_FILE);
-    let content = std::fs::read_to_string(&manifest_path).ok()?;
+    // Read only a regular file, and check the descriptor actually opened
+    // rather than the path: a manifest symlinked to /dev/zero or replaced by
+    // a FIFO would otherwise hang or exhaust memory during a routine scan,
+    // and a link to a regular file would read outside the model directory.
+    if !std::fs::symlink_metadata(&manifest_path)
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let mut file = std::fs::File::open(&manifest_path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_MANIFEST_BYTES {
+        return None;
+    }
+    let mut content = String::new();
+    use std::io::Read;
+    file.take(MAX_MANIFEST_BYTES)
+        .read_to_string(&mut content)
+        .ok()?;
     let manifest: ModelManifest = serde_json::from_str(&content).ok()?;
     Some(DiscoveredModel {
         path: model_dir.to_path_buf(),
@@ -175,6 +272,20 @@ fn load_manifest(model_dir: &Path) -> Option<DiscoveredModel> {
 
 /// Unified model status check with configurable verification depth.
 pub fn model_status(model_dir: &Path, mode: VerifyMode) -> ModelStatus {
+    // Verification reads paths built from untrusted manifest entries (and the
+    // setup wizard runs it automatically), so resolve the model dir with the
+    // same containment rule mutating operations use before touching anything
+    // underneath it. A dir that does not exist or escapes the models root is
+    // reported as "not installed" — the same answer a missing manifest gives.
+    let model_dir = match canonical_dir_within_root(model_dir, &models_dir()) {
+        Ok(dir) => dir,
+        Err(e) => {
+            log::warn!("model status: {e}");
+            return ModelStatus::NotInstalled;
+        }
+    };
+    let model_dir = model_dir.as_path();
+
     let model = match load_manifest(model_dir) {
         Some(m) => m,
         None => return ModelStatus::NotInstalled,
@@ -222,6 +333,10 @@ pub fn model_status(model_dir: &Path, mode: VerifyMode) -> ModelStatus {
 }
 
 /// Check a single file against its manifest entry.
+///
+/// `model_dir` must already be canonicalized (see `model_status`). A manifest
+/// entry that does not resolve to a regular file strictly inside `model_dir`
+/// counts as *not present* — verification never reads it.
 fn check_file(
     model_dir: &Path,
     file: &ModelFile,
@@ -230,11 +345,33 @@ fn check_file(
     new_cache: &mut HashMap<String, ChecksumEntry>,
     cache_dirty: &mut bool,
 ) -> bool {
-    let file_path = model_dir.join(&file.name);
-    let meta = match std::fs::metadata(&file_path) {
+    // Same validation as the mutating paths: reject absolute/traversal names
+    // lexically, then reject a symlink at any component and require the
+    // deepest existing ancestor to canonicalize back inside the model dir.
+    let file_path = match manifest_entry_path(model_dir, &file.name)
+        .and_then(|p| ensure_target_contained(model_dir, &p).map(|()| p))
+    {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("skipping manifest entry {:?}: {e}", file.name);
+            return false;
+        }
+    };
+
+    // `symlink_metadata` + `is_file` so a directory, fifo or device node in
+    // the model dir is never sized, mtime-cached or hashed.
+    let meta = match std::fs::symlink_metadata(&file_path) {
         Ok(m) => m,
         Err(_) => return false,
     };
+    if !meta.file_type().is_file() {
+        log::warn!(
+            "skipping manifest entry {:?}: {} is not a regular file",
+            file.name,
+            file_path.display()
+        );
+        return false;
+    }
 
     // manifest 有 size → 比较
     if file.size > 0 && meta.len() != file.size {
@@ -279,45 +416,188 @@ fn check_file(
     }
 }
 
-// ─── Remove ─────────────────────────────────────────────────────────
+// ─── Path Containment ───────────────────────────────────────────────
 
-/// Remove downloaded model files, keeping the manifest.
-pub fn remove_model_files(model_dir: &Path) -> Result<usize> {
-    let mut removed = 0;
-    let entries =
-        std::fs::read_dir(model_dir).map_err(|e| KoeError::Config(format!("read dir: {e}")))?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        if name == MANIFEST_FILE {
-            continue;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            removed += count_files_recursive(&path);
-            std::fs::remove_dir_all(&path)
-                .map_err(|e| KoeError::Config(format!("remove dir {}: {e}", path.display())))?;
-        } else if path.is_file() {
-            std::fs::remove_file(&path)
-                .map_err(|e| KoeError::Config(format!("remove {}: {e}", path.display())))?;
-            removed += 1;
-        }
+/// Reject model directories whose path contains `..` or `.` components.
+/// Relative model names are joined under `models_dir()` before reaching the
+/// mutating operations, so a traversal component would escape the base.
+fn validate_model_dir(model_dir: &Path) -> Result<()> {
+    use std::path::Component;
+    if model_dir
+        .components()
+        .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(KoeError::Config(format!(
+            "model dir {} contains path traversal components",
+            model_dir.display()
+        )));
     }
-    Ok(removed)
+    Ok(())
 }
 
-fn count_files_recursive(dir: &Path) -> usize {
-    let mut count = 0;
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                count += count_files_recursive(&path);
-            } else {
-                count += 1;
+/// Resolve a manifest-declared file name strictly beneath `model_dir`.
+///
+/// Manifest entries are untrusted input: reject absolute paths and any
+/// non-normal component (`..`, `.`, prefixes) so mutating operations can
+/// never create, overwrite, or delete files outside the model directory.
+fn manifest_entry_path(model_dir: &Path, name: &str) -> Result<PathBuf> {
+    use std::path::Component;
+    let mut resolved = model_dir.to_path_buf();
+    let mut has_component = false;
+    for component in Path::new(name).components() {
+        match component {
+            Component::Normal(part) => {
+                has_component = true;
+                resolved.push(part);
+            }
+            _ => {
+                return Err(KoeError::Config(format!(
+                    "unsafe file name in manifest: {name:?}"
+                )));
             }
         }
     }
-    count
+    if !has_component {
+        return Err(KoeError::Config(format!(
+            "empty file name in manifest: {name:?}"
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Canonicalize `model_dir` for a MUTATING operation (download, remove,
+/// part-file creation) and enforce containment.
+///
+/// The lexical checks above cannot see symlinks: a symlinked directory under
+/// the models root would redirect deletion and part-file writes to arbitrary
+/// external paths. Canonicalizing resolves symlinks up front; if the caller's
+/// path claims to live under the models root, its canonical form must still
+/// be inside the canonical models root. Absolute model dirs outside the root
+/// are documented and stay supported (the caller owns those paths).
+fn canonical_model_dir_for_mutation(model_dir: &Path) -> Result<PathBuf> {
+    validate_model_dir(model_dir)?;
+    canonical_dir_within_root(model_dir, &models_dir())
+}
+
+fn canonical_dir_within_root(model_dir: &Path, models_root: &Path) -> Result<PathBuf> {
+    let canonical = std::fs::canonicalize(model_dir)
+        .map_err(|e| KoeError::Config(format!("canonicalize {}: {e}", model_dir.display())))?;
+    if model_dir.starts_with(models_root) {
+        let canonical_root = std::fs::canonicalize(models_root).map_err(|e| {
+            KoeError::Config(format!("canonicalize {}: {e}", models_root.display()))
+        })?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(KoeError::Config(format!(
+                "model dir {} resolves outside the models directory ({})",
+                model_dir.display(),
+                canonical.display()
+            )));
+        }
+    }
+    Ok(canonical)
+}
+
+/// Reject a target when any already-existing component below the (canonical)
+/// model dir is a symlink, then require the deepest existing ancestor to
+/// canonicalize back inside the model dir.
+///
+/// Used for both mutating and read-only (verification) access. Without this,
+/// `File::create`/append on a planted symlink would truncate or grow a file
+/// outside the model directory, removal/pruning through a symlinked
+/// subdirectory would affect external files, and sha256 verification would
+/// read whatever a planted link points at.
+fn ensure_target_contained(canonical_dir: &Path, target: &Path) -> Result<()> {
+    let rel = target.strip_prefix(canonical_dir).map_err(|_| {
+        KoeError::Config(format!(
+            "target {} is not inside model dir {}",
+            target.display(),
+            canonical_dir.display()
+        ))
+    })?;
+
+    let mut current = canonical_dir.to_path_buf();
+    let mut deepest_existing = canonical_dir.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(KoeError::Config(format!(
+                    "refusing to operate on {}: {} is a symlink",
+                    target.display(),
+                    current.display()
+                )));
+            }
+            Ok(_) => deepest_existing = current.clone(),
+            // Component not created yet — nothing below it can exist either.
+            Err(_) => break,
+        }
+    }
+
+    let canonical_ancestor = std::fs::canonicalize(&deepest_existing).map_err(|e| {
+        KoeError::Config(format!("canonicalize {}: {e}", deepest_existing.display()))
+    })?;
+    if !canonical_ancestor.starts_with(canonical_dir) {
+        return Err(KoeError::Config(format!(
+            "target {} resolves outside model dir {}",
+            target.display(),
+            canonical_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The `.part` sibling used while a file is being downloaded.
+fn part_path_for(dest: &Path) -> PathBuf {
+    dest.with_extension(format!(
+        "{}.part",
+        dest.extension().unwrap_or_default().to_string_lossy()
+    ))
+}
+
+// ─── Remove ─────────────────────────────────────────────────────────
+
+/// Remove downloaded model files, keeping the manifest.
+///
+/// Deletion is manifest-driven: only files listed in the manifest (plus the
+/// koe-owned checksum cache and `.part` leftovers) are removed, and every
+/// path is validated to stay inside `model_dir`. Requires a parseable
+/// manifest so a bogus directory can never be swept wholesale.
+pub fn remove_model_files(model_dir: &Path) -> Result<usize> {
+    let model_dir = &canonical_model_dir_for_mutation(model_dir)?;
+    let model = load_manifest(model_dir).ok_or_else(|| {
+        KoeError::Config(format!("manifest not found in {}", model_dir.display()))
+    })?;
+
+    let mut removed = 0;
+    for file in &model.manifest.files {
+        let path = manifest_entry_path(model_dir, &file.name)?;
+        ensure_target_contained(model_dir, &path)?;
+        let part = part_path_for(&path);
+        ensure_target_contained(model_dir, &part)?;
+        for target in [&part, &path] {
+            if target.is_file() {
+                std::fs::remove_file(target)
+                    .map_err(|e| KoeError::Config(format!("remove {}: {e}", target.display())))?;
+                removed += 1;
+            }
+        }
+        // Prune now-empty subdirectories between the file and model_dir.
+        let mut parent = path.parent();
+        while let Some(dir) = parent {
+            if dir == model_dir || std::fs::remove_dir(dir).is_err() {
+                break;
+            }
+            parent = dir.parent();
+        }
+    }
+
+    let cache = model_dir.join(CHECKSUM_CACHE_FILE);
+    if cache.is_file() {
+        std::fs::remove_file(&cache)
+            .map_err(|e| KoeError::Config(format!("remove {}: {e}", cache.display())))?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 // ─── Download ───────────────────────────────────────────────────────
@@ -349,7 +629,8 @@ pub async fn download_model<F>(
 where
     F: Fn(DownloadProgress) + Send + Sync + 'static,
 {
-    let model = load_manifest(model_dir).ok_or_else(|| {
+    let model_dir = canonical_model_dir_for_mutation(model_dir)?;
+    let model = load_manifest(&model_dir).ok_or_else(|| {
         KoeError::Config(format!("manifest not found in {}", model_dir.display()))
     })?;
 
@@ -436,7 +717,8 @@ async fn download_file<F>(
 where
     F: Fn(DownloadProgress),
 {
-    let dest = model_dir.join(&file.name);
+    let dest = manifest_entry_path(model_dir, &file.name)?;
+    ensure_target_contained(model_dir, &dest)?;
 
     // Already complete?
     if let Ok(meta) = std::fs::metadata(&dest) {
@@ -480,16 +762,35 @@ where
     }
 
     // Resume from .part file
-    let part_path = dest.with_extension(format!(
-        "{}.part",
-        dest.extension().unwrap_or_default().to_string_lossy()
-    ));
+    let part_path = part_path_for(&dest);
+    ensure_target_contained(model_dir, &part_path)?;
 
-    let existing_size = if part_path.exists() {
+    // Effective per-file byte limit: exact manifest size when declared,
+    // otherwise the hard cap so an unsized manifest can never stream forever.
+    let size_limit = if file.size > 0 {
+        file.size
+    } else {
+        MAX_UNSIZED_DOWNLOAD_BYTES
+    };
+
+    let mut existing_size = if part_path.exists() {
         std::fs::metadata(&part_path).map(|m| m.len()).unwrap_or(0)
     } else {
         0
     };
+
+    // A partial file larger than the expected size can never verify; discard
+    // it instead of resuming (and growing) it.
+    if existing_size > size_limit {
+        log::warn!(
+            "partial file for {} is larger than expected ({} > {} bytes), restarting download",
+            file.name,
+            existing_size,
+            size_limit
+        );
+        let _ = std::fs::remove_file(&part_path);
+        existing_size = 0;
+    }
 
     let mut request = client.get(&file.url);
     if existing_size > 0 {
@@ -507,6 +808,16 @@ where
     let resuming = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
 
     let mut out = if resuming && existing_size > 0 {
+        // Only ever append to a pre-existing regular file: a symlink (or
+        // anything else) planted at the .part path must not be followed.
+        let meta = std::fs::symlink_metadata(&part_path)
+            .map_err(|e| KoeError::Config(format!("stat part file: {e}")))?;
+        if !meta.file_type().is_file() {
+            return Err(KoeError::Config(format!(
+                "refusing to resume {}: not a regular file",
+                part_path.display()
+            )));
+        }
         on_progress(DownloadProgress {
             file_index,
             file_count,
@@ -526,7 +837,20 @@ where
                 .await
                 .map_err(|e| KoeError::Config(format!("create dir: {e}")))?;
         }
-        tokio::fs::File::create(&part_path)
+        // Create-new semantics so a path planted between the containment check
+        // and the open (symlink, directory, …) fails instead of being
+        // followed/truncated. Remove any stale leftover first — it is either a
+        // regular .part we are intentionally restarting, or a non-file that
+        // must not survive; remove_file unlinks a symlink itself, never its
+        // target.
+        if std::fs::symlink_metadata(&part_path).is_ok() {
+            std::fs::remove_file(&part_path)
+                .map_err(|e| KoeError::Config(format!("remove stale part file: {e}")))?;
+        }
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&part_path)
             .await
             .map_err(|e| KoeError::Config(format!("create part file: {e}")))?
     };
@@ -547,6 +871,17 @@ where
             .await
             .map_err(|e| KoeError::Config(format!("write {}: {e}", file.name)))?;
         downloaded += chunk.len() as u64;
+        // Abort as soon as the stream exceeds the limit (manifest size, or
+        // the hard cap when the manifest declares none) — don't wait for the
+        // stream to end to notice an unbounded download.
+        if downloaded > size_limit {
+            drop(out);
+            let _ = std::fs::remove_file(&part_path);
+            return Err(KoeError::Config(format!(
+                "download {}: received {} bytes, exceeds limit of {} bytes",
+                file.name, downloaded, size_limit
+            )));
+        }
         on_progress(DownloadProgress {
             file_index,
             file_count,
@@ -596,10 +931,34 @@ where
     Ok(())
 }
 
+/// Hash a regular file.
+///
+/// Hashing reads to EOF, so a character device (`/dev/zero`) or fifo would
+/// stream forever. The pre-open `symlink_metadata` check keeps us from ever
+/// *opening* such a path (opening a fifo alone would block), and the post-open
+/// `metadata` (an `fstat` on the descriptor we actually read) is authoritative
+/// against a swap between the two.
 fn sha256_file(path: &Path) -> Result<String> {
     use std::io::{BufReader, Read};
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| KoeError::Config(format!("stat for sha256: {e}")))?;
+    if !meta.file_type().is_file() {
+        return Err(KoeError::Config(format!(
+            "refusing to hash {}: not a regular file",
+            path.display()
+        )));
+    }
     let f =
         std::fs::File::open(path).map_err(|e| KoeError::Config(format!("open for sha256: {e}")))?;
+    let opened = f
+        .metadata()
+        .map_err(|e| KoeError::Config(format!("stat for sha256: {e}")))?;
+    if !opened.file_type().is_file() {
+        return Err(KoeError::Config(format!(
+            "refusing to hash {}: not a regular file",
+            path.display()
+        )));
+    }
     let mut reader = BufReader::with_capacity(128 * 1024, f);
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 128 * 1024]; // heap-allocated, safe for GCD worker threads
@@ -1099,6 +1458,240 @@ mod tests {
     }
 
     #[test]
+    fn manifest_entry_path_accepts_normal_relative_names() {
+        let base = Path::new("/base/models/m");
+        assert_eq!(
+            manifest_entry_path(base, "model.bin").unwrap(),
+            base.join("model.bin")
+        );
+        assert_eq!(
+            manifest_entry_path(base, "subdir/config.json").unwrap(),
+            base.join("subdir/config.json")
+        );
+    }
+
+    #[test]
+    fn manifest_entry_path_rejects_traversal_and_absolute_names() {
+        let base = Path::new("/base/models/m");
+        assert!(manifest_entry_path(base, "../evil.bin").is_err());
+        assert!(manifest_entry_path(base, "sub/../../evil.bin").is_err());
+        assert!(manifest_entry_path(base, "/etc/passwd").is_err());
+        assert!(manifest_entry_path(base, "./model.bin").is_err());
+        assert!(manifest_entry_path(base, "").is_err());
+    }
+
+    #[test]
+    fn validate_model_dir_rejects_parent_components() {
+        assert!(validate_model_dir(Path::new("/home/u/.koe/models/../x")).is_err());
+        assert!(validate_model_dir(Path::new("./models/x")).is_err());
+        assert!(validate_model_dir(Path::new("/home/u/.koe/models/x")).is_ok());
+    }
+
+    #[test]
+    fn remove_model_files_requires_parseable_manifest() {
+        let tmp = std::env::temp_dir().join(format!(
+            "koe-model-test-nomanifest-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("stray.bin"), b"data").unwrap();
+
+        assert!(remove_model_files(&tmp).is_err());
+        assert!(tmp.join("stray.bin").exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn remove_model_files_refuses_traversal_entries_and_unlisted_files() {
+        let tmp = std::env::temp_dir().join(format!(
+            "koe-model-test-traversal-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let model_dir = tmp.join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        let victim = tmp.join("victim.txt");
+        fs::write(&victim, b"do not delete").unwrap();
+
+        let manifest = ModelManifest {
+            provider: "test".into(),
+            mode: None,
+            description: "test".into(),
+            repo: "test/model".into(),
+            files: vec![ModelFile {
+                name: "../victim.txt".into(),
+                size: 13,
+                sha256: String::new(),
+                url: String::new(),
+            }],
+        };
+        fs::write(
+            model_dir.join(MANIFEST_FILE),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::write(model_dir.join("unlisted.bin"), b"stray").unwrap();
+
+        assert!(remove_model_files(&model_dir).is_err());
+        assert!(victim.exists());
+        // Unlisted files are never swept by manifest-driven deletion.
+        assert!(model_dir.join("unlisted.bin").exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_model_files_refuses_symlinked_entry_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "koe-model-test-symfile-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let model_dir = tmp.join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        let victim = tmp.join("victim.bin");
+        fs::write(&victim, b"victim data").unwrap();
+        std::os::unix::fs::symlink(&victim, model_dir.join("model.bin")).unwrap();
+
+        let manifest = ModelManifest {
+            provider: "test".into(),
+            mode: None,
+            description: "test".into(),
+            repo: "test/model".into(),
+            files: vec![ModelFile {
+                name: "model.bin".into(),
+                size: 11,
+                sha256: String::new(),
+                url: String::new(),
+            }],
+        };
+        fs::write(
+            model_dir.join(MANIFEST_FILE),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert!(remove_model_files(&model_dir).is_err());
+        // The external victim file must be untouched.
+        assert_eq!(fs::read(&victim).unwrap(), b"victim data");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_model_files_refuses_symlinked_intermediate_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "koe-model-test-symdir-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let model_dir = tmp.join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        let external = tmp.join("external");
+        fs::create_dir_all(&external).unwrap();
+        fs::write(external.join("config.json"), b"external").unwrap();
+        std::os::unix::fs::symlink(&external, model_dir.join("subdir")).unwrap();
+
+        let manifest = ModelManifest {
+            provider: "test".into(),
+            mode: None,
+            description: "test".into(),
+            repo: "test/model".into(),
+            files: vec![ModelFile {
+                name: "subdir/config.json".into(),
+                size: 8,
+                sha256: String::new(),
+                url: String::new(),
+            }],
+        };
+        fs::write(
+            model_dir.join(MANIFEST_FILE),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        assert!(remove_model_files(&model_dir).is_err());
+        // The file behind the symlinked directory must be untouched.
+        assert_eq!(fs::read(external.join("config.json")).unwrap(), b"external");
+        assert!(external.exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_model_dir_under_root_is_rejected_for_mutation() {
+        let tmp = std::env::temp_dir().join(format!(
+            "koe-model-test-symroot-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let root = tmp.join("models");
+        fs::create_dir_all(&root).unwrap();
+        let outside = tmp.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("evil")).unwrap();
+
+        // A model dir that lexically claims to be under the root but resolves
+        // elsewhere is refused.
+        assert!(canonical_dir_within_root(&root.join("evil"), &root).is_err());
+
+        // A real directory under the root is accepted.
+        let good = root.join("good");
+        fs::create_dir_all(&good).unwrap();
+        let canonical = canonical_dir_within_root(&good, &root).unwrap();
+        assert!(canonical.starts_with(fs::canonicalize(&root).unwrap()));
+
+        // Absolute model dirs outside the root stay supported (documented).
+        assert!(canonical_dir_within_root(&outside, &root).is_ok());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_target_containment_rejects_symlinked_part_and_entry_paths() {
+        let tmp = std::env::temp_dir().join(format!(
+            "koe-model-test-target-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let model_dir = tmp.join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        let victim = tmp.join("victim.part");
+        fs::write(&victim, b"external part").unwrap();
+        let canonical = fs::canonicalize(&model_dir).unwrap();
+
+        // Symlinked final component (e.g. a planted .part file) is refused.
+        std::os::unix::fs::symlink(&victim, canonical.join("model.bin.part")).unwrap();
+        assert!(ensure_target_contained(&canonical, &canonical.join("model.bin.part")).is_err());
+
+        // Regular file and not-yet-created targets are fine.
+        fs::write(canonical.join("model.bin"), b"data").unwrap();
+        assert!(ensure_target_contained(&canonical, &canonical.join("model.bin")).is_ok());
+        assert!(ensure_target_contained(&canonical, &canonical.join("new.bin")).is_ok());
+        assert!(ensure_target_contained(&canonical, &canonical.join("sub/new.bin")).is_ok());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn cache_only_no_cache_file_does_not_panic() {
         // Simulates what scan_models_json does: CacheOnly on a model
         // directory that has never been verified (no .koe-checksum.json).
@@ -1146,6 +1739,279 @@ mod tests {
 
         // No cache file should have been written
         assert!(!tmp.join(CHECKSUM_CACHE_FILE).exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    // ─── Verification-path containment ──────────────────────────────
+
+    fn unique_tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "koe-model-test-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn sha_of(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn write_manifest(model_dir: &Path, files: Vec<ModelFile>) {
+        let manifest = ModelManifest {
+            provider: "test".into(),
+            mode: None,
+            description: "test".into(),
+            repo: "test/model".into(),
+            files,
+        };
+        fs::write(
+            model_dir.join(MANIFEST_FILE),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Verification must not read a file the manifest points at outside the
+    /// model dir. The manifest here declares the victim's real size and sha,
+    /// so a verification that *did* follow the entry would report Installed.
+    #[test]
+    fn verification_refuses_traversal_and_absolute_manifest_entries() {
+        let tmp = unique_tmp("verify-traversal");
+        let model_dir = tmp.join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        let victim_content = b"secret file contents";
+        let victim = tmp.join("victim.bin");
+        fs::write(&victim, victim_content).unwrap();
+
+        for name in ["../victim.bin", "./victim.bin", "sub/../../victim.bin"] {
+            write_manifest(
+                &model_dir,
+                vec![ModelFile {
+                    name: name.into(),
+                    size: victim_content.len() as u64,
+                    sha256: sha_of(victim_content),
+                    url: String::new(),
+                }],
+            );
+            for mode in [
+                VerifyMode::Normal,
+                VerifyMode::CacheOnly,
+                VerifyMode::ForceVerify,
+            ] {
+                assert_eq!(
+                    model_status(&model_dir, mode),
+                    ModelStatus::NotInstalled,
+                    "entry {name:?} in {mode:?} must not be read"
+                );
+            }
+        }
+
+        // Absolute manifest entries are refused the same way.
+        write_manifest(
+            &model_dir,
+            vec![ModelFile {
+                name: victim.to_string_lossy().into_owned(),
+                size: victim_content.len() as u64,
+                sha256: sha_of(victim_content),
+                url: String::new(),
+            }],
+        );
+        assert_eq!(
+            model_status(&model_dir, VerifyMode::Normal),
+            ModelStatus::NotInstalled
+        );
+
+        // Nothing was cached about the out-of-tree file.
+        assert!(!model_dir.join(CHECKSUM_CACHE_FILE).exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A symlinked manifest entry is not dereferenced by verification, even
+    /// though the link target matches the declared size and sha.
+    #[cfg(unix)]
+    #[test]
+    fn verification_refuses_symlinked_manifest_entry() {
+        let tmp = unique_tmp("verify-symlink-entry");
+        let model_dir = tmp.join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        let victim_content = b"outside the model dir";
+        let victim = tmp.join("victim.bin");
+        fs::write(&victim, victim_content).unwrap();
+        std::os::unix::fs::symlink(&victim, model_dir.join("model.bin")).unwrap();
+
+        write_manifest(
+            &model_dir,
+            vec![ModelFile {
+                name: "model.bin".into(),
+                size: victim_content.len() as u64,
+                sha256: sha_of(victim_content),
+                url: String::new(),
+            }],
+        );
+
+        assert_eq!(
+            model_status(&model_dir, VerifyMode::Normal),
+            ModelStatus::NotInstalled
+        );
+        assert_eq!(
+            model_status(&model_dir, VerifyMode::ForceVerify),
+            ModelStatus::NotInstalled
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Hashing refuses anything that is not a regular file, so a character
+    /// device such as `/dev/zero` can never be read unbounded.
+    #[cfg(unix)]
+    #[test]
+    fn sha256_file_refuses_non_regular_files() {
+        let err = sha256_file(Path::new("/dev/zero")).unwrap_err();
+        assert!(format!("{err}").contains("not a regular file"), "{err}");
+
+        let tmp = unique_tmp("sha-nonregular");
+        fs::create_dir_all(&tmp).unwrap();
+        assert!(sha256_file(&tmp).is_err());
+
+        // Regular files still hash.
+        fs::write(tmp.join("f.bin"), b"abc").unwrap();
+        assert_eq!(sha256_file(&tmp.join("f.bin")).unwrap(), sha_of(b"abc"));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A symlink planted at `.koe-checksum.json` must not be followed: the
+    /// victim it points at stays byte-for-byte intact, and verification of the
+    /// (well-formed) model still succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn verification_does_not_follow_symlinked_checksum_cache() {
+        let tmp = unique_tmp("verify-cache-symlink");
+        let model_dir = tmp.join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        let victim_content = b"important data that must survive verification";
+        let victim = tmp.join("victim.txt");
+        fs::write(&victim, victim_content).unwrap();
+        std::os::unix::fs::symlink(&victim, model_dir.join(CHECKSUM_CACHE_FILE)).unwrap();
+
+        let content = b"valid model content";
+        fs::write(model_dir.join("model.bin"), content).unwrap();
+        write_manifest(
+            &model_dir,
+            vec![ModelFile {
+                name: "model.bin".into(),
+                size: content.len() as u64,
+                sha256: sha_of(content),
+                url: String::new(),
+            }],
+        );
+
+        // Verification still works…
+        assert_eq!(
+            model_status(&model_dir, VerifyMode::Normal),
+            ModelStatus::Installed
+        );
+        // …and the victim was neither truncated nor overwritten.
+        assert_eq!(fs::read(&victim).unwrap(), victim_content);
+        // The planted link is still a link — nothing was written through it.
+        assert!(fs::symlink_metadata(model_dir.join(CHECKSUM_CACHE_FILE))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // The direct writer refuses too, rather than silently succeeding.
+        assert!(
+            write_checksum_cache(&model_dir.join(CHECKSUM_CACHE_FILE), &HashMap::new()).is_err()
+        );
+        assert_eq!(fs::read(&victim).unwrap(), victim_content);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// Well-formed models still verify, and the cache is still both consulted
+    /// and written: a planted entry with the file's real mtime but a wrong sha
+    /// changes the Normal-mode answer, which is only possible if it was read.
+    #[test]
+    fn well_formed_model_verifies_and_still_uses_the_cache() {
+        let tmp = unique_tmp("verify-cache-reuse");
+        fs::create_dir_all(&tmp).unwrap();
+
+        let content = b"valid model content";
+        fs::write(tmp.join("model.bin"), content).unwrap();
+        write_manifest(
+            &tmp,
+            vec![ModelFile {
+                name: "model.bin".into(),
+                size: content.len() as u64,
+                sha256: sha_of(content),
+                url: String::new(),
+            }],
+        );
+
+        // Normal computes and writes the cache back.
+        assert_eq!(
+            model_status(&tmp, VerifyMode::Normal),
+            ModelStatus::Installed
+        );
+        let cache_path = tmp.join(CHECKSUM_CACHE_FILE);
+        assert!(fs::symlink_metadata(&cache_path)
+            .unwrap()
+            .file_type()
+            .is_file());
+        let cached = load_checksum_cache(&cache_path).unwrap();
+        assert_eq!(cached.get("model.bin").unwrap().sha256, sha_of(content));
+        // No temp file left behind by the atomic write.
+        let leftovers: Vec<_> = fs::read_dir(&tmp)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty());
+
+        // CacheOnly can now answer without hashing.
+        assert_eq!(
+            model_status(&tmp, VerifyMode::CacheOnly),
+            ModelStatus::Installed
+        );
+
+        // Poison the cache with the real mtime but a wrong hash: Normal must
+        // trust it (proving it is read), ForceVerify must ignore it.
+        let meta = fs::metadata(tmp.join("model.bin")).unwrap();
+        let mut poisoned = HashMap::new();
+        poisoned.insert(
+            "model.bin".to_string(),
+            ChecksumEntry {
+                mtime: mtime_secs(&meta),
+                sha256: "0".repeat(64),
+            },
+        );
+        write_checksum_cache(&cache_path, &poisoned).unwrap();
+        assert_eq!(
+            model_status(&tmp, VerifyMode::Normal),
+            ModelStatus::NotInstalled
+        );
+        assert_eq!(
+            model_status(&tmp, VerifyMode::ForceVerify),
+            ModelStatus::Installed
+        );
+        // ForceVerify wrote the correct hash back.
+        assert_eq!(
+            load_checksum_cache(&cache_path)
+                .unwrap()
+                .get("model.bin")
+                .unwrap()
+                .sha256,
+            sha_of(content)
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

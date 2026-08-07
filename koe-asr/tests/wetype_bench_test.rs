@@ -111,7 +111,10 @@ async fn bench_resources() {
     );
     println!("real-time factor     : {rtf:.3}x  (lower is faster; <1 = faster than realtime)");
     println!("RSS before load      : {rss_before:.0} MB");
-    println!("RSS after load       : {rss_after_load:.0} MB   (resident model ≈ {:.0} MB)", rss_after_load - rss_before);
+    println!(
+        "RSS after load       : {rss_after_load:.0} MB   (resident model ≈ {:.0} MB)",
+        rss_after_load - rss_before
+    );
     println!("RSS mid-run          : {rss_mid:.0} MB");
     println!(
         "RSS after {runs} runs    : {rss_after:.0} MB   (drift vs after-load: {:+.1} MB — leak check)",

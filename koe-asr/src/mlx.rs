@@ -122,6 +122,30 @@ impl MlxProvider {
             }
         }
     }
+
+    /// Cancel the Swift session (if any) and reclaim the callback context.
+    ///
+    /// Idempotent: called from both `close()` and `Drop` — the generation is
+    /// zeroed after the cancel and the context pointer is `Option::take`n, so
+    /// a second call is a no-op.
+    ///
+    /// SAFETY: `koe_mlx_cancel()` synchronously clears the callback context on
+    /// the Swift side under the callback lock, and callback invocation holds
+    /// that same lock, so once it returns no further calls through the
+    /// callback pointer can occur.  Only then is it safe to free the boxed
+    /// senders.  The generation parameter makes a stale cancel a no-op if a
+    /// new session has already started on the Swift singleton.
+    fn shutdown_session(&mut self) {
+        if self.session_generation != 0 {
+            unsafe {
+                koe_mlx_cancel(self.session_generation);
+            }
+            self.session_generation = 0;
+        }
+        self.event_rx = None;
+        self.terminal_event_rx = None;
+        self.reclaim_sender();
+    }
 }
 
 #[async_trait::async_trait]
@@ -211,25 +235,17 @@ impl crate::provider::AsrProvider for MlxProvider {
     }
 
     async fn close(&mut self) -> Result<()> {
-        // SAFETY: koe_mlx_cancel() synchronously clears the callback context on
-        // the Swift side (under a lock), ensuring no further calls through the
-        // callback pointer after this returns.  Safe to reclaim the sender afterward.
-        //
-        // The generation parameter ensures that if a new session has already
-        // started on the singleton, this cancel is a no-op — it won't affect
-        // the new session.
-        unsafe {
-            koe_mlx_cancel(self.session_generation);
-        }
-        self.event_rx = None;
-        self.terminal_event_rx = None;
-        self.reclaim_sender();
+        self.shutdown_session();
         Ok(())
     }
 }
 
 impl Drop for MlxProvider {
     fn drop(&mut self) {
-        self.reclaim_sender();
+        // Must cancel the Swift session before freeing the callback context:
+        // if the provider is dropped without close() (e.g. the session task is
+        // aborted at runtime shutdown), Swift still holds the raw context
+        // pointer and its async tasks would otherwise call into freed memory.
+        self.shutdown_session();
     }
 }
