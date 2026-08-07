@@ -5,6 +5,24 @@
     <description>Updates for the standard app (Apple Silicon).</description>
     <language>en</language>
     <item>
+      <title>Version 1.0.27</title>
+      <link>https://github.com/missuo/koe/releases/tag/v1.0.27</link>
+      <description><![CDATA[
+<h3>Added</h3>
+<ul>
+<li><strong>Start and stop voice input from the status bar menu.</strong> The menu's status section now has a toggle item, so dictation still works when the global hotkey is unavailable (another app grabbed the trigger key, Accessibility permission not granted yet, …). A menu-started session behaves exactly like a hotkey-started one — same overlay, ASR, correction and paste — and either input can end it: the trigger key stops a session the menu started, and the menu stops one the trigger key started.</li>
+</ul>
+      ]]></description>
+      <sparkle:version>28</sparkle:version>
+      <sparkle:shortVersionString>1.0.27</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <pubDate>Fri, 07 Aug 2026 09:37:33 GMT</pubDate>
+      <enclosure url="https://github.com/missuo/koe/releases/download/v1.0.27/Koe-macOS-arm64.zip"
+        sparkle:edSignature="FzfXYrj08RvHoQ1YQ5AlcVdo7FNE6bf1KQx1YAINuIDt9FnAu55pXcyWvL23ft/76p/fvJgv27kUMpsR7d0PDw=="
+        length="12201405"
+        type="application/octet-stream" />
+    </item>
+    <item>
       <title>Version 1.0.26</title>
       <link>https://github.com/missuo/koe/releases/tag/v1.0.26</link>
       <description><![CDATA[
