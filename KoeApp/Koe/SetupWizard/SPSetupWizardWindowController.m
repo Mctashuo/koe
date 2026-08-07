@@ -702,6 +702,8 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 // Pane height needed for the MiMo provider (derived from the measured
 // privacy-notice height at build time).
 @property(nonatomic, assign) CGFloat asrMimoRequiredPaneHeight;
+@property(nonatomic, assign) CGFloat asrDoubaoImeRequiredPaneHeight;
+@property(nonatomic, assign) CGFloat asrWetypeRequiredPaneHeight;
 
 // Apple Speech locale selection
 @property(nonatomic, strong) NSPopUpButton *appleSpeechLocalePopup;
@@ -1470,13 +1472,16 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
       @"contact the Xiaomi team."];
   mimoPrivacyNotice.font = [NSFont systemFontOfSize:11];
   // Measured height so the full notice is always visible; sits below the
-  // test result row, growing downward.
-  CGFloat mimoNoticeW = paneWidth - fieldX - SPTheme.pageMargin;
+  // test result row, growing downward. All provider notes share the same
+  // horizontal span: from the label column's left edge to one card padding
+  // short of the card's right edge, so both sides read balanced.
+  CGFloat noteX = formX;
+  CGFloat noteW = contentX + contentW - SPTheme.cardPadding - noteX;
   CGFloat mimoNoticeH = [self fittingHeightForWrappingLabel:mimoPrivacyNotice
-                                                      width:mimoNoticeW];
+                                                      width:noteW];
   CGFloat mimoNoticeTop = mimoY - rowH * 2 - 6;
-  mimoPrivacyNotice.frame = NSMakeRect(fieldX, mimoNoticeTop - mimoNoticeH,
-                                       mimoNoticeW, mimoNoticeH);
+  mimoPrivacyNotice.frame = NSMakeRect(noteX, mimoNoticeTop - mimoNoticeH,
+                                       noteW, mimoNoticeH);
   mimoPrivacyNotice.textColor = [NSColor systemOrangeColor];
   mimoPrivacyNotice.tag = 1011;
   mimoPrivacyNotice.hidden = YES;
@@ -1484,6 +1489,46 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   // Pane height needed to show the whole notice (56pt bottom button area).
   self.asrMimoRequiredPaneHeight =
       ceil(contentHeight - NSMinY(mimoPrivacyNotice.frame)) + 56.0;
+
+  // DoubaoIME note — the built-in provider needs no setup at all, but it is
+  // a cloud service; make both facts explicit right under the provider row.
+  NSTextField *doubaoImeNote = [NSTextField wrappingLabelWithString:
+      @"No configuration needed — no API key or account required. "
+      @"Recognition runs on a built-in free cloud service, so an active "
+      @"network connection is required while dictating."];
+  doubaoImeNote.font = [NSFont systemFontOfSize:11];
+  // Same orange as the other provider notes — one visual voice for all of
+  // them (the user-visible convention: orange text = provider caveat).
+  doubaoImeNote.textColor = [NSColor systemOrangeColor];
+  CGFloat dbimeNoteH = [self fittingHeightForWrappingLabel:doubaoImeNote
+                                                     width:noteW];
+  CGFloat dbimeNoteTop = NSMinY(self.asrProviderPopup.frame) - 14.0;
+  doubaoImeNote.frame =
+      NSMakeRect(noteX, dbimeNoteTop - dbimeNoteH, noteW, dbimeNoteH);
+  doubaoImeNote.tag = 1012;
+  doubaoImeNote.hidden = YES;
+  [pane addSubview:doubaoImeNote];
+  self.asrDoubaoImeRequiredPaneHeight =
+      ceil(contentHeight - NSMinY(doubaoImeNote.frame)) + 56.0;
+
+  // WeType language note — in testing the on-device model only reliably
+  // recognizes Chinese; say so under its model rows.
+  NSTextField *wetypeNote = [NSTextField wrappingLabelWithString:
+      @"Note: in our testing this on-device model supports Chinese only. "
+      @"Other languages are not recognized."];
+  wetypeNote.font = [NSFont systemFontOfSize:11];
+  wetypeNote.textColor = [NSColor systemOrangeColor];
+  CGFloat wetypeNoteH = [self fittingHeightForWrappingLabel:wetypeNote
+                                                      width:noteW];
+  // Below the model progress row, clear of every model-management control.
+  CGFloat wetypeNoteTop = NSMinY(self.modelProgressBar.frame) - 18.0;
+  wetypeNote.frame =
+      NSMakeRect(noteX, wetypeNoteTop - wetypeNoteH, noteW, wetypeNoteH);
+  wetypeNote.tag = 1013;
+  wetypeNote.hidden = YES;
+  [pane addSubview:wetypeNote];
+  self.asrWetypeRequiredPaneHeight =
+      ceil(contentHeight - NSMinY(wetypeNote.frame)) + 56.0;
 
   // Test result label — pinned to the bottom of the form card rather than to a
   // fixed row, because the pane's height changes with the provider: anchored to
@@ -1634,6 +1679,18 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   CGFloat contentW = paneWidth - 2.0 * contentX;
   CGFloat contentHeight = [self paneViewportHeight];
 
+  // The correction note under the behaviour card consumes vertical space the
+  // viewport-sized layout did not budget for. Grow the pane by exactly that
+  // much (the pane scrolls) so the profiles area keeps its full height and
+  // the Test Connection button stays inside the detail card.
+  NSTextField *correctionNote = [self
+      descriptionLabel:@"LLM correction is off by default. While it is off, "
+                       @"the raw speech-recognition output is used directly "
+                       @"as the final result."];
+  CGFloat correctionNoteH =
+      [self fittingHeightForWrappingLabel:correctionNote width:contentW];
+  contentHeight += correctionNoteH + 10.0;
+
   // The profiles area is two cards side by side: the list on the left, the
   // selected profile's form on the right.
   CGFloat cardPad = SPTheme.cardPadding;
@@ -1663,8 +1720,8 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 
   // Description
   NSTextField *desc = [self
-      addSettingsDescriptionText:@"Configure LLM for post-correction. When "
-                                 @"disabled, raw ASR output is used directly."
+      addSettingsDescriptionText:@"Configure an LLM to polish the "
+                                 @"transcription after speech recognition."
                           toPane:pane
                             topY:y
                                x:contentX
@@ -1689,7 +1746,14 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   behaviourCard.frame = NSMakeRect(contentX, y - behaviourH, contentW, behaviourH);
   [pane addSubview:behaviourCard];
   [self layoutCardRowControls:behaviourCard.subviews.firstObject width:contentW];
-  y = NSMinY(behaviourCard.frame) - SPTheme.sectionGap;
+  y = NSMinY(behaviourCard.frame) - 10.0;
+
+  // Under the toggle: make the default and the disabled behavior explicit
+  // (pre-measured above so the pane height already budgets for it).
+  correctionNote.frame =
+      NSMakeRect(contentX, floor(y - correctionNoteH), contentW, correctionNoteH);
+  [pane addSubview:correctionNote];
+  y = NSMinY(correctionNote.frame) - SPTheme.sectionGap;
 
   NSTextField *sectionTitle = [self
       sectionTitleLabel:@"Profiles"
@@ -3556,7 +3620,47 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   desc.alignment = NSTextAlignmentCenter;
   CGFloat descH = [self fittingHeightForWrappingLabel:desc
                                                 width:paneWidth - 120];
-  CGFloat contentHeight = 308 + MAX(0.0, descH - 40.0) + 132.0;
+  // Contributors (GitHub usernames, ordered by contributions; bots
+  // excluded). Every name links to its GitHub profile.
+  NSArray<NSString *> *contributorLogins = @[
+    @"missuo", @"erning", @"thedavidweng", @"hyspace", @"foru17", @"Mctashuo",
+    @"taresky", @"simonxmau", @"imocat", @"nmvr2600", @"myWsq", @"barkure",
+    @"fuscoyu", @"kevinplus66"
+  ];
+  NSMutableParagraphStyle *contributorsPara = [[NSMutableParagraphStyle alloc] init];
+  contributorsPara.alignment = NSTextAlignmentCenter;
+  contributorsPara.lineSpacing = 3.0;
+  NSDictionary *contributorsBaseAttrs = @{
+    NSFontAttributeName : [NSFont systemFontOfSize:11],
+    NSForegroundColorAttributeName : [NSColor secondaryLabelColor],
+    NSParagraphStyleAttributeName : contributorsPara,
+  };
+  NSMutableAttributedString *contributorsText =
+      [[NSMutableAttributedString alloc] init];
+  for (NSUInteger i = 0; i < contributorLogins.count; i++) {
+    if (i > 0) {
+      [contributorsText appendAttributedString:
+          [[NSAttributedString alloc] initWithString:@"  ·  "
+                                          attributes:contributorsBaseAttrs]];
+    }
+    NSString *login = contributorLogins[i];
+    NSMutableDictionary *linkAttrs = [contributorsBaseAttrs mutableCopy];
+    linkAttrs[NSLinkAttributeName] =
+        [NSURL URLWithString:[@"https://github.com/" stringByAppendingString:login]];
+    [contributorsText appendAttributedString:
+        [[NSAttributedString alloc] initWithString:login attributes:linkAttrs]];
+  }
+  NSTextField *contributorsLabel = [NSTextField wrappingLabelWithString:@""];
+  // Selectable + editing-attributes is the NSTextField recipe that makes
+  // NSLinkAttributeName ranges clickable.
+  contributorsLabel.selectable = YES;
+  contributorsLabel.allowsEditingTextAttributes = YES;
+  contributorsLabel.attributedStringValue = contributorsText;
+  CGFloat contributorsH =
+      [self fittingHeightForWrappingLabel:contributorsLabel
+                                    width:paneWidth - 120];
+  CGFloat contentHeight =
+      308 + MAX(0.0, descH - 40.0) + 132.0 + contributorsH + 34.0;
   NSView *pane =
       [[NSView alloc] initWithFrame:NSMakeRect(0, 0, paneWidth, contentHeight)];
 
@@ -3629,6 +3733,19 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   license.alignment = NSTextAlignmentCenter;
   license.frame = NSMakeRect(24, y, paneWidth - 48, 20);
   [pane addSubview:license];
+  y -= 34;
+
+  // Contributors (pre-measured above)
+  NSTextField *contributorsTitle = [self
+      descriptionLabel:@"Thanks to everyone who has contributed to Koe ❤️"];
+  contributorsTitle.alignment = NSTextAlignmentCenter;
+  contributorsTitle.font = [NSFont systemFontOfSize:11 weight:NSFontWeightSemibold];
+  contributorsTitle.frame = NSMakeRect(24, y, paneWidth - 48, 16);
+  [pane addSubview:contributorsTitle];
+  y -= 6;
+  contributorsLabel.frame =
+      NSMakeRect(60, y - contributorsH, paneWidth - 120, contributorsH);
+  [pane addSubview:contributorsLabel];
 
   return pane;
 }
@@ -4061,7 +4178,12 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   NSView *row = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 100, rowHeight)];
 
   NSTextField *lbl = [self settingsRowLabelWithString:label];
-  lbl.frame = NSMakeRect(pad, (rowHeight - 20) / 2.0, 200, 20);
+  // Center the text's REAL height: a fixed 20pt frame draws the ~17pt text
+  // bottom-aligned inside it, which reads as sitting below the row's middle.
+  [lbl sizeToFit];
+  CGFloat lblH = lbl.frame.size.height;
+  lbl.frame =
+      NSMakeRect(pad, floor((rowHeight - lblH) / 2.0), 200, lblH);
   [row addSubview:lbl];
 
   CGFloat controlW = control.frame.size.width;
@@ -4257,30 +4379,19 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 // bottom-pinned test-result line, so no provider's last row lands on top of it.
 static const CGFloat kAsrStatusStripHeight = 34.0;
 
-// Each provider shows a different set of rows, so each needs a different slice
-// of the card. The rows are top-anchored, so a taller pane pushes them further
-// from the status strip, never into it.
+// The card keeps ONE fixed footprint for every provider — sized to the
+// tallest form (Doubao with Advanced expanded) and to the measured provider
+// notes. Compact providers simply leave empty card space; a card that
+// resized per provider made the whole pane jump on every switch.
 - (CGFloat)targetAsrPaneHeightForProvider:(NSString *)provider
                          advancedExpanded:(BOOL)expanded {
-  CGFloat rows;
-  if ([provider isEqualToString:@"doubaoime"]) {
-    rows = 180.0;
-  } else if ([provider isEqualToString:@"qwen"] ||
-             [provider isEqualToString:@"glm"]) {
-    rows = 300.0;
-  } else if ([provider isEqualToString:@"mimo"]) {
-    // Taller than GLM to fit the privacy notice under the API key row. The
-    // exact height is measured at pane-build time from the notice text.
-    return MAX(320.0, self.asrMimoRequiredPaneHeight) + kAsrStatusStripHeight;
-  } else if ([provider isEqualToString:@"apple-speech"]) {
-    rows = 240.0;
-  } else if ([provider isEqualToString:@"doubao"]) {
-    rows = expanded ? 460.0 : 370.0;
-  } else {
-    // mlx, sherpa-onnx — model row + status + progress
-    rows = 300.0;
-  }
-  return rows + kAsrStatusStripHeight;
+  CGFloat height = 460.0 + kAsrStatusStripHeight;
+  height = MAX(height, self.asrMimoRequiredPaneHeight + kAsrStatusStripHeight);
+  height = MAX(height,
+               self.asrDoubaoImeRequiredPaneHeight + kAsrStatusStripHeight);
+  height = MAX(height,
+               self.asrWetypeRequiredPaneHeight + kAsrStatusStripHeight);
+  return height;
 }
 
 // Each provider needs a different amount of the pane. The window no longer
@@ -4437,6 +4548,16 @@ static const CGFloat kAsrStatusStripHeight = 34.0;
     [self populateLocalModelPopup:selectedProvider mode:@"asr"];
     [self updateModelStatusLabel];
   }
+
+  // Provider-specific notes: DoubaoIME's no-configuration note and WeType's
+  // Chinese-only note.
+  [self setHidden:!isDoubaoIme
+      forViewsMatchingTags:[NSIndexSet indexSetWithIndex:1012]
+                    inView:self.currentPaneView];
+  BOOL isWetype = [selectedProvider isEqualToString:@"wetype"];
+  [self setHidden:!isWetype
+      forViewsMatchingTags:[NSIndexSet indexSetWithIndex:1013]
+                    inView:self.currentPaneView];
 
   // Hide test button for local providers (no remote connection to test)
   BOOL isLocal = !isDoubaoIme && !isDoubao && !isQwen && !isGlm && !isMimo;
