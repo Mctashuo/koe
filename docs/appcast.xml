@@ -5,6 +5,24 @@
     <description>Updates for the standard app (Apple Silicon).</description>
     <language>en</language>
     <item>
+      <title>Version 1.0.29</title>
+      <link>https://github.com/missuo/koe/releases/tag/v1.0.29</link>
+      <description><![CDATA[
+<h3>Fixed</h3>
+<ul>
+<li><strong>Quitting Koe should no longer trigger phantom key presses in other apps.</strong> After long dictation sessions, quitting (or restarting for an update) could make other apps see key presses nobody made — a phantom Fn tap, or even another app's shortcut like a screenshot hotkey firing. The 1.0.21 mitigation kept Koe's keyboard listener in a passive mode that cannot cause this, but two features added in 1.0.22 — accepting the raw transcript with Return during LLM correction, and the template number shortcuts — quietly switched it back to an intercepting mode around every correction and every template window. Those keys are now captured through the system's hotkey facility instead, so the keyboard listener stays passive for its entire lifetime when the trigger is a modifier key (Fn, Option, …). The Return accept and number shortcuts work exactly as before.</li>
+</ul>
+      ]]></description>
+      <sparkle:version>30</sparkle:version>
+      <sparkle:shortVersionString>1.0.29</sparkle:shortVersionString>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <pubDate>Fri, 07 Aug 2026 17:52:32 GMT</pubDate>
+      <enclosure url="https://github.com/missuo/koe/releases/download/v1.0.29/Koe-macOS-arm64.zip"
+        sparkle:edSignature="f8rG/v5SCjoHvj3IB4vO1kRGEFdgkCQaK6Vdi0/ZYEsU2UvtHuNVXK4Lr68uM+ZgHpuJ7mjGYyWjmzStCYmDDw=="
+        length="12219013"
+        type="application/octet-stream" />
+    </item>
+    <item>
       <title>Version 1.0.28</title>
       <link>https://github.com/missuo/koe/releases/tag/v1.0.28</link>
       <description><![CDATA[
