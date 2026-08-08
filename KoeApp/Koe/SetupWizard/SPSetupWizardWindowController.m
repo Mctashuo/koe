@@ -549,6 +549,17 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 // single truncating line and mirrors the full text into its tooltip.
 @interface SPStatusLabel : NSTextField
 @property(nonatomic, assign) BOOL growsDownward;
+/// Upper bound for growing mode. A provider can return an arbitrarily long
+/// error (a full JSON body), and an unbounded label grows straight out of
+/// its card and off the pane. Anything past the bound is truncated on
+/// screen and kept in the tooltip. 0 means unbounded.
+@property(nonatomic, assign) CGFloat maxGrowHeight;
+/// A view the label must stay inside of (its card). The bound is recomputed
+/// on every text change rather than fixed at build time: panes are re-laid
+/// out after they are hosted in the scroll view, so a build-time measurement
+/// is stale by the time a message actually arrives.
+@property(nonatomic, weak) NSView *growthBoundsView;
+@property(nonatomic, assign) CGFloat growthBottomInset;
 @end
 
 @implementation SPStatusLabel
@@ -557,6 +568,9 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   [super setStringValue:stringValue];
   if (self.growsDownward) {
     [self sp_remeasureHeight];
+    // Whatever did not fit is still reachable, and the label is selectable
+    // so the full text can be copied out of the tooltip's source.
+    self.toolTip = stringValue.length > 0 ? stringValue : nil;
   } else {
     self.toolTip = stringValue.length > 0 ? stringValue : nil;
   }
@@ -569,6 +583,15 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   NSTextFieldCell *cell = (NSTextFieldCell *)self.cell;
   NSSize size = [cell cellSizeForBounds:NSMakeRect(0, 0, width, CGFLOAT_MAX)];
   CGFloat height = ceil(MAX(18.0, size.height));
+  if (self.maxGrowHeight > 0.0) {
+    height = MIN(height, self.maxGrowHeight);
+  }
+  NSView *bounds = self.growthBoundsView;
+  if (bounds) {
+    CGFloat room =
+        NSMaxY(self.frame) - (NSMinY(bounds.frame) + self.growthBottomInset);
+    height = MIN(height, MAX(18.0, room));
+  }
   NSRect frame = self.frame;
   frame.origin.y = NSMaxY(frame) - height;
   frame.size.height = height;
@@ -576,6 +599,71 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 }
 
 @end
+
+/// Condense a provider error for display. Remote APIs answer failures with a
+/// JSON body, and dumping it raw into a settings label is both unreadable and
+/// unbounded. Pulls out the human-readable message (and error code when
+/// present) and keeps the leading "HTTP 429 Too Many Requests" context.
+/// Anything that is not recognizably JSON is returned unchanged.
+static NSString *SPCondensedProviderError(NSString *raw) {
+  if (raw.length == 0)
+    return raw;
+  NSRange brace = [raw rangeOfString:@"{"];
+  if (brace.location == NSNotFound)
+    return raw;
+
+  NSString *prefix =
+      [[raw substringToIndex:brace.location]
+          stringByTrimmingCharactersInSet:
+              [NSCharacterSet characterSetWithCharactersInString:@" :\n\t"]];
+  NSString *jsonPart = [raw substringFromIndex:brace.location];
+  NSDictionary *json = [NSJSONSerialization
+      JSONObjectWithData:[jsonPart dataUsingEncoding:NSUTF8StringEncoding]
+                 options:0
+                   error:nil];
+  if (![json isKindOfClass:[NSDictionary class]])
+    return raw;
+
+  id errorValue = json[@"error"];
+  NSString *detail = nil;
+  NSString *code = nil;
+  if ([errorValue isKindOfClass:[NSDictionary class]]) {
+    id message = errorValue[@"message"];
+    if ([message isKindOfClass:[NSString class]])
+      detail = message;
+    for (NSString *key in @[ @"code", @"type" ]) {
+      id value = errorValue[key];
+      if ([value isKindOfClass:[NSString class]] && [value length] > 0) {
+        code = value;
+        break;
+      }
+    }
+  } else if ([errorValue isKindOfClass:[NSString class]]) {
+    detail = errorValue;
+  } else if ([json[@"message"] isKindOfClass:[NSString class]]) {
+    detail = json[@"message"];
+  }
+
+  if (detail.length == 0)
+    return raw;
+
+  // Providers like to append documentation links and hints after the actual
+  // reason. The first sentence is the part a user acts on; the rest stays in
+  // the tooltip.
+  NSRange sentenceEnd = [detail rangeOfString:@". "];
+  if (sentenceEnd.location != NSNotFound && sentenceEnd.location > 24)
+    detail = [detail substringToIndex:sentenceEnd.location + 1];
+  if (detail.length > 150)
+    detail = [[detail substringToIndex:149] stringByAppendingString:@"…"];
+
+  NSMutableString *condensed = [NSMutableString string];
+  if (prefix.length > 0)
+    [condensed appendFormat:@"%@ — ", prefix];
+  [condensed appendString:detail];
+  if (code.length > 0)
+    [condensed appendFormat:@" (%@)", code];
+  return condensed;
+}
 
 @interface SPTemplateRowView : NSTableRowView
 @end
@@ -729,7 +817,7 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
 @property(nonatomic, strong) NSButton *llmRefreshModelsButton;
 @property(nonatomic, strong) NSTextField *llmChatCompletionsPathField;
 @property(nonatomic, strong) NSButton *llmTestButton;
-@property(nonatomic, strong) NSTextField *llmTestResultLabel;
+@property(nonatomic, strong) SPStatusLabel *llmTestResultLabel;
 @property(nonatomic, assign) BOOL llmRemoteModelPickerExpanded;
 @property(nonatomic, assign) BOOL llmRemoteModelPickerRowVisible;
 
@@ -1690,6 +1778,12 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   CGFloat correctionNoteH =
       [self fittingHeightForWrappingLabel:correctionNote width:contentW];
   contentHeight += correctionNoteH + 10.0;
+  // Room the result line under the Test Connection button may occupy: two
+  // lines. The form already reaches the card's bottom edge, so without this
+  // the result renders below the card entirely (issue #118). The pane grows
+  // by it and scrolls; -showLlmTestResult: scrolls the line into view.
+  const CGFloat kLlmTestResultReserve = 60.0;
+  contentHeight += kLlmTestResultReserve;
 
   // The profiles area is two cards side by side: the list on the left, the
   // selected profile's form on the right.
@@ -2129,10 +2223,18 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
   for (NSView *sub in pane.subviews) {
     if (sub == listCard || sub == detailCard)
       continue;
+    if (sub == self.llmTestResultLabel)
+      continue; // reserved for explicitly below, not by its current height
     if (NSMinX(sub.frame) < detailCardX - 1.0)
       continue; // list side, or the page-wide header rows
     lowestFormEdge = MIN(lowestFormEdge, NSMinY(sub.frame));
   }
+  // The result label is measured by its RESERVE, not by whatever it happens
+  // to hold right now: hugging to an empty (or one-line) label would shrink
+  // the card to exactly the space a later failure message needs.
+  lowestFormEdge = MIN(lowestFormEdge,
+                       NSMaxY(self.llmTestResultLabel.frame) -
+                           kLlmTestResultReserve);
   if (lowestFormEdge < CGFLOAT_MAX) {
     // Only ever shrinks: clamped at the page margin so a form that already
     // fills the card cannot push the cards below the pane.
@@ -2155,6 +2257,24 @@ static void ensureCustomHotkeyInPopup(NSPopUpButton *popup, NSString *value) {
     deleteFrame.origin.y = addFrame.origin.y;
     self.llmDeleteProfileButton.frame = deleteFrame;
   }
+
+  // The test result is the one label whose content is arbitrary provider
+  // text (issue #118: a JSON error body grew it straight through the card
+  // edge and off the pane). Pin it inside the card for good: it spans the
+  // card's full inner width, keeps its top edge under the Test button, and
+  // may never grow past the card's bottom padding. Whatever still does not
+  // fit stays in the tooltip.
+  CGFloat resultTop = NSMaxY(self.llmTestResultLabel.frame);
+  CGFloat resultLeft = detailLabelX;
+  CGFloat resultWidth = detailCardX + detailCardW - cardPad - resultLeft;
+  self.llmTestResultLabel.frame =
+      NSMakeRect(resultLeft, resultTop - 18.0, resultWidth, 18.0);
+  // Two lines at most, and never past the card's bottom padding — the room
+  // is re-evaluated on every message because the pane is re-laid out after
+  // it is hosted (a build-time bound would be stale).
+  self.llmTestResultLabel.maxGrowHeight = kLlmTestResultReserve;
+  self.llmTestResultLabel.growthBoundsView = detailCard;
+  self.llmTestResultLabel.growthBottomInset = cardPad;
 
   return pane;
 }
@@ -6304,6 +6424,18 @@ static void appleSpeechInstallCallback(void *ctx, int32_t eventType,
       });
 }
 
+/// Set the LLM test result line and make sure it is actually on screen: the
+/// pane reserves room for it below the Test button, which can sit past the
+/// viewport fold on short windows (issue #118).
+- (void)showLlmTestResult:(NSString *)text color:(NSColor *)color {
+  self.llmTestResultLabel.stringValue = text ?: @"";
+  self.llmTestResultLabel.textColor = color;
+  if (text.length > 0) {
+    [self.llmTestResultLabel
+        scrollRectToVisible:NSInsetRect(self.llmTestResultLabel.bounds, 0, -8.0)];
+  }
+}
+
 - (void)updateLlmFieldsEnabled {
   BOOL enabled = (self.llmEnabledCheckbox.state == NSControlStateValueOn);
   self.llmProfileTableView.enabled = enabled;
@@ -6619,8 +6751,8 @@ static void appleSpeechInstallCallback(void *ctx, int32_t eventType,
                                        encoding:NSUTF8StringEncoding]
                : nil;
   if (profileJson.length == 0) {
-    self.llmTestResultLabel.stringValue = @"Test failed: invalid profile data";
-    self.llmTestResultLabel.textColor = [NSColor systemRedColor];
+    [self showLlmTestResult:@"Test failed: invalid profile data"
+                      color:[NSColor systemRedColor]];
     return;
   }
 
@@ -6651,9 +6783,8 @@ static void appleSpeechInstallCallback(void *ctx, int32_t eventType,
               (self.llmEnabledCheckbox.state == NSControlStateValueOn);
 
           if (!result) {
-            self.llmTestResultLabel.stringValue =
-                @"Test failed: invalid response from core";
-            self.llmTestResultLabel.textColor = [NSColor systemRedColor];
+            [self showLlmTestResult:@"Test failed: invalid response from core"
+                              color:[NSColor systemRedColor]];
             return;
           }
 
@@ -6666,10 +6797,17 @@ static void appleSpeechInstallCallback(void *ctx, int32_t eventType,
                                                elapsedMs.doubleValue / 1000.0]
                   : @"";
 
-          self.llmTestResultLabel.stringValue =
-              [NSString stringWithFormat:@"%@%@", message, timeStr];
-          self.llmTestResultLabel.textColor =
-              success ? [NSColor systemGreenColor] : [NSColor systemRedColor];
+          NSString *display =
+              success ? message : SPCondensedProviderError(message);
+          [self showLlmTestResult:[NSString stringWithFormat:@"%@%@", display,
+                                                             timeStr]
+                            color:success ? [NSColor systemGreenColor]
+                                          : [NSColor systemRedColor]];
+          // The tooltip carries the provider's untouched response for anyone
+          // debugging a failure the condensed line does not explain.
+          if (!success && ![display isEqualToString:message]) {
+            self.llmTestResultLabel.toolTip = message;
+          }
         });
       });
 }
